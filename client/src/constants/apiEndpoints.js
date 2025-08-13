@@ -1,0 +1,1 @@
+export const RUN_CODE = (language) => `/run/${language}`;
