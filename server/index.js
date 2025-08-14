@@ -1,315 +1,262 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const { spawn } = require("child_process");
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { codeRunner } = require("./services/codeRunnerServices");
 const cors = require("cors");
+
+// Import our utilities and services
+const config = require("./config/config");
+const Logger = require("./utils/logger");
+const SessionManager = require("./utils/SessionManager");
+const { codeRunner } = require("./services/codeRunnerServices");
+const { validateInputSize } = require("./utils/security");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
+// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: `${Math.floor(config.MAX_CODE_SIZE / 1024)}kb` }));
 
-// Base directory for user folders
-const USER_BASE_DIR = path.join(__dirname, "user_folders");
+// Request logging middleware
+app.use((req, res, next) => {
+  Logger.info('HTTP Request', {
+    method: req.method,
+    path: req.path,
+    userAgent: req.get('User-Agent'),
+    ip: req.ip
+  });
+  next();
+});
 
 // Ensure base directory exists
-if (!fs.existsSync(USER_BASE_DIR)) {
-  fs.mkdirSync(USER_BASE_DIR, { recursive: true });
+if (!fs.existsSync(config.USER_BASE_DIR)) {
+  fs.mkdirSync(config.USER_BASE_DIR, { recursive: true });
 }
 
-// Store active user sessions
-const activeShells = new Map();
+// Initialize session manager
+const sessionManager = new SessionManager();
 
-// Create a custom shell wrapper that intercepts and validates all commands
-function createShellWrapper(userId) {
-  const userDir = path.join(USER_BASE_DIR, userId);
-  const wrapperPath = path.join(userDir, ".shell_wrapper.js");
-  
-  // Create the wrapper script content
-  const wrapperContent = `
-#!/usr/bin/env node
-const readline = require('readline');
-const { spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
-
-// User's confined directory
-const USER_DIR = "${userDir.replace(/\\/g, "\\\\")}";
-
-// Commands that are completely forbidden
-const FORBIDDEN_COMMANDS = [
-  'sudo', 'su', 'chmod', 'chown', 'ssh', 'scp', 'ftp', 'wget', 'curl',
-  'telnet', 'nc', 'netcat', 'ping', 'traceroute', 'dig', 'nslookup', 
-  'ifconfig', 'ipconfig', 'netstat'
-];
-
-// Commands that can only operate within the user directory
-const PATH_RESTRICTED_COMMANDS = [
-  'cat', 'ls', 'dir', 'cd', 'cp', 'mv', 'rm', 'mkdir', 'rmdir', 'touch',
-  'echo', 'more', 'less', 'head', 'tail', 'grep', 'find', 'sed', 'awk',
-  'nano', 'vi', 'vim', 'emacs', 'code', 'open', 'xdg-open', 'start'
-];
-
-// Start the real shell
-const shell = spawn('${os.platform() === "win32" ? "powershell.exe" : "bash"}', [], {
-  cwd: USER_DIR,
-  stdio: ['pipe', 'pipe', 'pipe']
-});
-
-// Set up the readline interface
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: '${userId}@sandbox:~$ '
-});
-
-// Output the initial prompt
-rl.prompt();
-
-// Display welcome message
-console.log('\\n=== SANDBOX ENVIRONMENT ===');
-console.log(\`You are restricted to the directory: \${USER_DIR}\`);
-console.log('Some commands are restricted for security.\\n');
-
-// Handle shell output
-shell.stdout.on('data', (data) => {
-  process.stdout.write(data);
-  rl.prompt();
-});
-
-shell.stderr.on('data', (data) => {
-  process.stderr.write(data);
-  rl.prompt();
-});
-
-// Function to validate if a path is within the user directory
-function isPathWithinUserDir(testPath) {
-  // Resolve to absolute path
-  const absPath = path.resolve(USER_DIR, testPath);
-  return absPath.startsWith(USER_DIR);
-}
-
-// Function to validate a command
-function validateCommand(command) {
-  // Split the command by spaces to get the main command and arguments
-  const parts = command.trim().split(/\\s+/);
-  const mainCommand = parts[0].toLowerCase();
-  
-  // Check if command is forbidden
-  if (FORBIDDEN_COMMANDS.includes(mainCommand)) {
-    return {
-      valid: false,
-      message: \`Command '\${mainCommand}' is not allowed in this sandbox environment.\`
-    };
-  }
-  
-  // For path-restricted commands, validate all arguments that could be paths
-  if (PATH_RESTRICTED_COMMANDS.includes(mainCommand)) {
-    // Extract potential path arguments (skip the command itself)
-    for (let i = 1; i < parts.length; i++) {
-      const arg = parts[i];
-      
-      // Skip arguments that are flags
-      if (arg.startsWith('-')) continue;
-      
-      // Skip arguments that are environment variables or special symbols
-      if (arg.startsWith('$') || arg === '>' || arg === '>>' || arg === '|' || arg === '&') continue;
-      
-      // If the argument contains file path patterns, ensure they're within the user dir
-      if (!isPathWithinUserDir(arg) && 
-          // Don't block paths that are clearly not file paths
-          !(arg.startsWith('--') || arg.match(/^[a-zA-Z0-9_-]+$/))) {
-        return {
-          valid: false,
-          message: \`Access denied: You can only access files within your sandbox directory.\`
-        };
-      }
-    }
-  }
-  
-  // Handle shell escapes and command sequences
-  if (command.includes('$(') || command.includes('\`') || 
-      command.includes(';') || command.includes('&&') || 
-      command.includes('||') || command.includes('|')) {
-    
-    // This is a simplified check - a production system would need more sophisticated parsing
-    return {
-      valid: false,
-      message: \`Command sequences and shell escapes are not allowed in this sandbox.\`
-    };
-  }
-  
-  return { valid: true };
-}
-
-// Handle user input
-rl.on('line', (line) => {
-  const command = line.trim();
-  
-  // Handle exit command
-  if (command === 'exit' || command === 'quit') {
-    shell.kill();
-    process.exit(0);
-    return;
-  }
-  
-  // Special command to show current directory
-  if (command === 'pwd') {
-    console.log(USER_DIR);
-    rl.prompt();
-    return;
-  }
-  
-  // Skip empty commands
-  if (!command) {
-    rl.prompt();
-    return;
-  }
-  
-  // Validate the command
-  const validation = validateCommand(command);
-  if (!validation.valid) {
-    console.log(\`\\x1b[31m\${validation.message}\\x1b[0m\`);
-    rl.prompt();
-    return;
-  }
-  
-  // Execute the command
-  shell.stdin.write(command + '\\n');
-});
-
-// Handle shell exit
-shell.on('exit', () => {
-  console.log('Shell exited');
-  process.exit();
-});
-
-// Handle SIGINT (Ctrl+C)
-rl.on('SIGINT', () => {
-  shell.kill('SIGINT');
-  rl.prompt();
-});
-  `;
-  
-  fs.writeFileSync(wrapperPath, wrapperContent);
-  fs.chmodSync(wrapperPath, '755');
-  
-  return wrapperPath;
-}
-
-io.on("connection", (socket) => {
-  console.log("Client connected");
-  
-  // Get user ID from socket (from query or headers)
-  const userId = socket.handshake.query.userId || 
-                 socket.handshake.headers.userId || 
-                 `user_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 5)}`;
-  
-  console.log(`User connected: ${userId}`);
-  
-  // Create user directory if it doesn't exist
-  const userDir = path.join(USER_BASE_DIR, userId);
-  if (!fs.existsSync(userDir)) {
-    fs.mkdirSync(userDir, { recursive: true });
-    
-    // Create a welcome file in the user's directory
-    fs.writeFileSync(
-      path.join(userDir, "welcome.txt"), 
-      `Welcome ${userId}! This is your private workspace.`
-    );
-  }
-  
-  // Create the shell wrapper script
-  const wrapperPath = createShellWrapper(userId);
-  
-  // Start the shell process using our wrapper
-  const shellProcess = spawn('node', [wrapperPath], {
-    stdio: ["pipe", "pipe", "pipe"]
-  });
-  
-  // Store the shell process for this user
-  activeShells.set(userId, shellProcess);
-
-  shellProcess.stdout.on("data", (data) => {
-    console.log(`[${userId}] stdout: ${data.toString().trim()}`);
-    socket.emit("output-success", data.toString());
-  });
-
-  shellProcess.stderr.on("data", (data) => {
-    console.log(`[${userId}] stderr: ${data.toString().trim()}`);
-    socket.emit("output-error", data.toString());
-  });
-
-  socket.on("input", (data) => {
-    shellProcess.stdin.write(data + "\n");
-  });
-
-  socket.on("disconnect", () => {
-    shellProcess.kill();
-    activeShells.delete(userId);
-    console.log(`Client ${userId} disconnected`);
+// Health check endpoint
+app.get('/health', (req, res) => {
+  const stats = sessionManager.getStats();
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    ...stats
   });
 });
 
-app.post("/run/:language", (req, res) => {
+// Statistics endpoint  
+app.get('/stats', (req, res) => {
+  const stats = sessionManager.getStats();
+  res.json(stats);
+});
+
+// Socket.io connection handling
+io.on("connection", async (socket) => {
+  let session = null;
+  
   try {
-    let code = req.body.code;
-    const language = req.params.language;
-    const userId = req.headers.userid || req.query.userId || `user_${Date.now().toString(36)}`;
+    Logger.info("Client connecting", { socketId: socket.id });
     
-    // Create user directory if it doesn't exist
-    const userDir = path.join(USER_BASE_DIR, userId);
-    if (!fs.existsSync(userDir)) {
-      fs.mkdirSync(userDir, { recursive: true });
-    }
+    // Get user ID from socket
+    const rawUserId = socket.handshake.query.userId || 
+                     socket.handshake.headers.userId;
     
-    // Save the code to the user's directory
-    const filename = `${Date.now()}_code.${language}`;
-    fs.writeFileSync(path.join(userDir, filename), code);
+    // Create or get user session
+    session = await sessionManager.createSession(rawUserId, socket);
     
-    // Get the user's shell process if it exists
-    let shellProcess = activeShells.get(userId);
+    Logger.info("Client connected", { 
+      userId: session.userId, 
+      socketId: socket.id 
+    });
     
-    if (!shellProcess) {
-      // User is not connected via socket, create a temporary shell wrapper
-      const wrapperPath = createShellWrapper(userId);
-      shellProcess = spawn('node', [wrapperPath], {
-        stdio: ["pipe", "pipe", "pipe"]
+    // Handle user input
+    socket.on("input", (data) => {
+      try {
+        if (!data || typeof data !== 'string') {
+          socket.emit("output-error", "Invalid input format\n");
+          return;
+        }
+        
+        // Validate input size
+        const sizeValidation = validateInputSize(data, config.MAX_CODE_SIZE);
+        if (!sizeValidation.valid) {
+          socket.emit("output-error", `Error: ${sizeValidation.message}\n`);
+          return;
+        }
+        
+        session.executeCommand(data);
+      } catch (error) {
+        Logger.error("Error handling input", { 
+          userId: session.userId, 
+          error: error.message 
+        });
+        socket.emit("output-error", "An error occurred processing your command\n");
+      }
+    });
+
+    // Handle disconnection
+    socket.on("disconnect", () => {
+      Logger.info("Client disconnected", { 
+        userId: session?.userId, 
+        socketId: socket.id 
       });
       
-      // Clean up the temporary shell after some time
-      setTimeout(() => {
-        if (shellProcess && !shellProcess.killed) {
-          shellProcess.kill();
-        }
-      }, 30000); // 30 seconds timeout
+      if (session) {
+        sessionManager.handleSocketDisconnect(session.userId);
+      }
+    });
+    
+  } catch (error) {
+    Logger.error("Error in socket connection", { 
+      socketId: socket.id, 
+      error: error.message 
+    });
+    
+    socket.emit("output-error", `Connection error: ${error.message}\n`);
+    socket.disconnect();
+  }
+});
+
+// Code execution endpoint
+app.post("/run/:language", async (req, res) => {
+  let session = null;
+  
+  try {
+    const { code } = req.body;
+    const language = req.params.language;
+    const rawUserId = req.headers.userid || req.query.userId;
+    
+    // Validate inputs
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ 
+        success: false,
+        message: "Code is required and must be a string" 
+      });
     }
     
-    // Run the code through our code runner, which should respect the sandbox too
-    let isExecutedSuccessfully = codeRunner(language, code, shellProcess, userDir);
+    if (!language || typeof language !== 'string') {
+      return res.status(400).json({ 
+        success: false,
+        message: "Language parameter is required" 
+      });
+    }
     
-    if (isExecutedSuccessfully) {
-      res.status(200).send({ 
-        message: "Code running...",
-        userDirectory: userId, // Only send the ID, not the full path for security
-        filename: filename
+    // Validate code size
+    const sizeValidation = validateInputSize(code, config.MAX_CODE_SIZE);
+    if (!sizeValidation.valid) {
+      return res.status(400).json({
+        success: false,
+        message: sizeValidation.message
+      });
+    }
+    
+    // Create or get user session
+    session = await sessionManager.createSession(rawUserId);
+    
+    Logger.info("Code execution request", { 
+      userId: session.userId, 
+      language, 
+      codeSize: Buffer.byteLength(code, 'utf8') 
+    });
+    
+    // Save the code to the user's directory  
+    const filename = session.writeCodeFile(code, language);
+    
+    // Execute the code
+    const executed = codeRunner(language, code, session);
+    
+    if (executed) {
+      res.status(200).json({ 
+        success: true,
+        message: "Code execution started",
+        userDirectory: session.userId,
+        filename: filename,
+        executionId: `${session.userId}_${Date.now()}`
       });
     } else {
-      res.status(400).send({ message: "Invalid language" });
+      res.status(400).json({ 
+        success: false,
+        message: `Unsupported language: ${language}` 
+      });
     }
+    
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Something went wrong!" });
+    Logger.error("Code execution error", { 
+      userId: session?.userId,
+      error: error.message,
+      stack: error.stack
+    });
+    
+    res.status(500).json({ 
+      success: false,
+      message: "Internal server error occurred during code execution" 
+    });
   }
 });
 
-server.listen(8080, () => {
-  console.log("Server running on port 8080");
-  console.log(`User directories will be created in: ${USER_BASE_DIR}`);
+// Error handling middleware
+app.use((error, req, res, next) => {
+  Logger.error("Unhandled HTTP error", {
+    error: error.message,
+    path: req.path,
+    method: req.method
+  });
+  
+  res.status(500).json({
+    success: false,
+    message: "Internal server error"
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "Endpoint not found"
+  });
+});
+
+// Graceful shutdown handling
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+async function gracefulShutdown(signal) {
+  Logger.info(`Received ${signal}, starting graceful shutdown...`);
+  
+  try {
+    // Stop accepting new connections
+    server.close(() => {
+      Logger.info('HTTP server closed');
+    });
+    
+    // Shutdown session manager
+    await sessionManager.shutdown();
+    
+    Logger.info('Graceful shutdown completed');
+    process.exit(0);
+  } catch (error) {
+    Logger.error('Error during shutdown', { error: error.message });
+    process.exit(1);
+  }
+}
+
+// Start server
+server.listen(config.PORT, () => {
+  Logger.info("Server started", {
+    port: config.PORT,
+    environment: config.NODE_ENV,
+    userBaseDir: config.USER_BASE_DIR,
+    maxConnections: config.MAX_CONNECTIONS,
+    sessionTimeout: config.SESSION_TIMEOUT
+  });
 });
