@@ -1,627 +1,410 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const path = require("path");
-const fs = require("fs").promises;
-const fsSync = require("fs");
-const { spawn } = require("child_process");
-const cors = require("cors");
-const { codeRunner } = require("./services/codeRunnerServices"); // If unused you may remove
-const { v4: uuidv4 } = require("uuid");
+/**
+ * Minimal DevSpace Server
+ * - No progress / banner
+ * - Immediate shell access
+ * - Explicit container cleanup when shell (exec) ends
+ */
+
+import express from "express";
+import http from "http";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import cors from "cors";
+import { Server } from "socket.io";
+import { v4 as uuidv4 } from "uuid";
+import os from "os";
+import Docker from "dockerode";
+
+import {
+  ensureWorkspaceRoot,
+  createSessionExecShell,
+  resizeExecTTY,
+  stopAndRemoveContainer,
+  removeWorkspaceDir,
+  startStatsStream,
+  stopStatsStream,
+  getAllowlist,
+  getAllowedNetworkModes,
+  getDefaultNetworkMode
+} from "./containerManager.js";
+
+import {
+  initSchema,
+  inputSchema,
+  resizeSchema,
+  killSchema,
+  statsSubscribeSchema,
+  statsUnsubscribeSchema,
+  validateRequest,
+  sanitizeUsername,
+  deriveSessionToken,
+  verifySessionToken
+} from "./security.js";
+
+const PORT = process.env.PORT || 8080;
+const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const SANDBOX_MODE = process.env.SANDBOX_MODE || "container";
+
+const MAX_IDLE_MINUTES = parseInt(process.env.MAX_IDLE_MINUTES || "120", 10);
+const CLEAN_INTERVAL_SECONDS = parseInt(process.env.CLEAN_INTERVAL_SECONDS || "60", 10);
+
+const INPUT_MAX_TOKENS_PER_SEC = parseInt(process.env.INPUT_MAX_TOKENS_PER_SEC || "8000", 10);
+const INPUT_BURST_BYTES = parseInt(process.env.INPUT_BURST_BYTES || "16000", 10);
+
+const MAX_CONCURRENT_SESSIONS = parseInt(process.env.MAX_CONCURRENT_SESSIONS || "0", 10);
+const MAX_SESSIONS_PER_USER = parseInt(process.env.MAX_SESSIONS_PER_USER || "0", 10);
+
+const SOCKET_INIT_RATE_WINDOW_MS = parseInt(process.env.SOCKET_INIT_RATE_WINDOW_MS || "60000", 10);
+const SOCKET_INIT_MAX = parseInt(process.env.SOCKET_INIT_MAX || "10", 10);
+
+const SERVER_INSTANCE_SECRET = (process.env.SERVER_INSTANCE_SECRET || "").trim();
+const DEBUG_SANDBOX = process.env.DEBUG_SANDBOX === "1";
+
+const RESOURCE_KILL_MEM_PERCENT = parseInt(process.env.RESOURCE_KILL_MEM_PERCENT || "0", 10);
+const RESOURCE_KILL_CPU_PERCENT = parseInt(process.env.RESOURCE_KILL_CPU_PERCENT || "0", 10);
+const RESOURCE_KILL_SUSTAIN_MS = parseInt(process.env.RESOURCE_KILL_SUSTAIN_MS || "15000", 10);
+const RESOURCE_KILL_GRACE_MS = parseInt(process.env.RESOURCE_KILL_GRACE_MS || "5000", 10);
+const RESOURCE_CHECK_INTERVAL_MS = parseInt(process.env.RESOURCE_CHECK_INTERVAL_MS || "2000", 10);
+
+if (!SERVER_INSTANCE_SECRET || SERVER_INSTANCE_SECRET.length < 16) {
+  console.error("[FATAL] SERVER_INSTANCE_SECRET must be set (>=16 chars)");
+  process.exit(1);
+}
+
+await ensureWorkspaceRoot();
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    methods: ["GET", "POST"]
-  }
+app.set("trust proxy", 1);
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(cors({ origin: CLIENT_URL, credentials: true }));
+app.use(express.json({ limit: "64kb", strict: true }));
+
+const publicLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false
 });
+app.use(["/health", "/config"], publicLimiter);
 
-app.use(cors());
-app.use(express.json());
-
-/**
- * sessions: Map<socketId, { username, rootDir, cwd, createdAt }>
- */
 const sessions = new Map();
+const userSessionCount = new Map();
+const socketInitTracker = new Map();
 
-const WORKSPACES_BASE = path.join(__dirname, "user_workspaces");
-ensureDirSync(WORKSPACES_BASE);
-
-// ---------- Utility Helpers ----------
-
-function ensureDirSync(p) {
-  if (!fsSync.existsSync(p)) fsSync.mkdirSync(p, { recursive: true });
+function now() { return Date.now(); }
+function userCount(u) { return userSessionCount.get(u) || 0; }
+function incUser(u) { userSessionCount.set(u, (userSessionCount.get(u) || 0) + 1); }
+function decUser(u) {
+  const c = userSessionCount.get(u) || 0;
+  if (c <= 1) userSessionCount.delete(u); else userSessionCount.set(u, c - 1);
+}
+function refillTokens(sess) {
+  const ts = now();
+  const elapsed = (ts - sess.lastRefill) / 1000;
+  if (elapsed <= 0) return;
+  const add = elapsed * INPUT_MAX_TOKENS_PER_SEC;
+  sess.inputTokens = Math.min(INPUT_BURST_BYTES, sess.inputTokens + add);
+  sess.lastRefill = ts;
 }
 
-async function ensureDir(p) {
-  try { await fs.access(p); } catch { await fs.mkdir(p, { recursive: true }); }
-}
-
-function sanitizeUsername(name = "user") {
-  return name.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "user";
-}
-
-function normalizeCommandInput(raw) {
-  // Example normalization (keep simple)
-  return raw.replace(/^\s*cd\.\.(?=$|\s|\/)/, "cd ..").trim();
-}
-
-/**
- * Safe path resolution within workspace root.
- * Accepts absolute-like inputs by stripping leading / and treating relative to root.
- */
-function safeResolve(root, currentRel, targetRel) {
-  const raw = targetRel && targetRel.length ? targetRel : ".";
-  let candidate;
-  if (path.isAbsolute(raw)) {
-    candidate = path.join(root, raw.replace(/^\/+/, ""));
-  } else {
-    candidate = path.join(root, currentRel, raw);
-  }
-  const resolved = path.resolve(candidate);
-  if (!resolved.startsWith(root)) {
-    return null;
-  }
-  return resolved;
-}
-
-function relativeDisplay(root, abs) {
-  return path.relative(root, abs) || ".";
-}
-
-function buildPrompt(session) {
-  return `[${session.username}@IDE] ${session.cwd}$ `;
-}
-
-/**
- * Produce Unix-like rwxrwxrwx string (simplified) + file type.
- */
-function fileModeString(stat) {
-  const mode = stat.mode;
-  const isDir = stat.isDirectory();
-  const type = isDir ? "d" : "-";
-  const triplet = (bits) =>
-    (bits & 4 ? "r" : "-") + (bits & 2 ? "w" : "-") + (bits & 1 ? "x" : "-");
-  const owner = triplet((mode >> 6) & 0o7);
-  const group = triplet((mode >> 3) & 0o7);
-  const other = triplet(mode & 0o7);
-  return type + owner + group + other;
-}
-
-/**
- * Argument parser with flag clustering.
- * Supports:
- *   command [-abc] [--long] -- path-starting-with-dash
- * End of flags marker: --
- */
-function parseCommandLine(rawLine) {
-  const tokens = rawLine.trim().split(/\s+/).filter(Boolean);
-  if (!tokens.length) return { command: "", flags: new Set(), positional: [] };
-
-  const command = tokens.shift();
-  const flags = new Set();
-  const positional = [];
-  let endOfFlags = false;
-
-  for (const token of tokens) {
-    if (!endOfFlags && token === "--") {
-      endOfFlags = true;
-      continue;
-    }
-    if (!endOfFlags && token.startsWith("--") && token.length > 2) {
-      // whole long flag
-      flags.add(token.slice(2));
-    } else if (!endOfFlags && token.startsWith("-") && token.length > 1) {
-      // cluster of short flags
-      const cluster = token.slice(1).split("");
-      cluster.forEach(f => flags.add(f));
-    } else {
-      positional.push(token);
-    }
-  }
-  return { command, flags, positional };
-}
-
-/**
- * Directory listing (simple)
- */
-async function listDirectorySimple(absPath, root) {
-  const entries = await fs.readdir(absPath, { withFileTypes: true });
-  return entries
-    .map(e => {
-      const name = e.name + (e.isDirectory() ? "/" : "");
-      return name;
-    })
-    .sort((a, b) => a.localeCompare(b));
-}
-
-/**
- * Directory or file info in long format.
- */
-async function listLong(absPath, root) {
-  const lines = [];
-  const stat = await fs.stat(absPath);
-  if (stat.isDirectory()) {
-    const entries = await fs.readdir(absPath, { withFileTypes: true });
-    for (const dirent of entries) {
-      const entryAbs = path.join(absPath, dirent.name);
-      const s = await fs.stat(entryAbs);
-      lines.push(formatLongEntry(entryAbs, s, dirent.isDirectory(), root));
-    }
-  } else {
-    lines.push(formatLongEntry(absPath, stat, stat.isDirectory(), root));
-  }
-  return lines.sort((a, b) => a.localeCompare(b));
-}
-
-function formatLongEntry(abs, stat, isDir, root) {
-  const mode = fileModeString(stat);
-  const size = String(stat.size).padStart(8, " ");
-  const mtime = new Date(stat.mtime).toISOString().replace("T", " ").slice(0, 19);
-  let name = path.basename(abs);
-  if (isDir) name += "/";
-  return `${mode} ${size} ${mtime} ${name}`;
-}
-
-/**
- * Remove path (file or directory recursively).
- */
-async function removePath(absPath, { recursive = false, force = false, rootDir }) {
-  try {
-    const stat = await fs.stat(absPath).catch(err => {
-      if (force && err.code === "ENOENT") return null;
-      throw err;
-    });
-    if (!stat) return { ok: true, msg: "missing (ignored)" };
-    if (absPath === rootDir) {
-      return { ok: false, msg: "refusing to remove workspace root" };
-    }
-    if (stat.isDirectory()) {
-      if (!recursive) return { ok: false, msg: "is a directory (use -r)" };
-      if (fs.rm) {
-        await fs.rm(absPath, { recursive: true, force: true });
-      } else {
-        await removeDirRecursiveLegacy(absPath);
-      }
-      return { ok: true, msg: "removed directory" };
-    } else {
-      await fs.unlink(absPath);
-      return { ok: true, msg: "removed file" };
-    }
-  } catch (e) {
-    if (force) return { ok: true, msg: `ignored error (${e.message})` };
-    return { ok: false, msg: e.message };
-  }
-}
-
-async function removeDirRecursiveLegacy(dir) {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      await removeDirRecursiveLegacy(full);
-    } else {
-      await fs.unlink(full).catch(() => {});
-    }
-  }
-  await fs.rmdir(dir).catch(() => {});
-}
-
-/**
- * Read file safely (utf8)
- */
-async function readFileSafe(absPath) {
-  return fs.readFile(absPath, "utf8");
-}
-
-/**
- * Write file (creating dirs)
- */
-async function writeFileSafe(absPath, content = "") {
-  await ensureDir(path.dirname(absPath));
-  await fs.writeFile(absPath, content, "utf8");
-}
-
-// ---------- Pseudo Shell Command Handler ----------
-async function handlePseudoShellCommand(socket, session, input) {
-  const raw = input || "";
-  const normalized = normalizeCommandInput(raw);
-  if (!normalized) return;
-
-  // Parse line
-  const { command: cmd, flags, positional } = parseCommandLine(normalized);
-
-  const send = (type, msg) => {
-    // Ensure trailing newline for consistency with typical terminal output
-    if (!msg.endsWith("\n")) msg += "\n";
-    socket.emit(type, msg);
-  };
-
-  const emitCwd = () => {
-    socket.emit("cwd-update", { cwd: session.cwd });
-  };
-
-  switch (cmd) {
-    case "":
-      return;
-
-    case "help":
-      send("output-success",
-`Available commands (sandboxed):
-  help                       Show this help
-  ls [-l] [-a] [path]        List directory (long or include dotfiles)
-  pwd                        Show current directory
-  cd <path>                  Change directory (restricted)
-  cat <file>                 Show file contents
-  touch <file>               Create empty file
-  mkdir <dir>                Create directory
-  rm [-r] [-f] <path...>     Remove file(s) / dir(s)
-  run <lang> <file>          Execute file (node|python|py|js)
-  clear                      (Client side – not processed here)
-Notes:
-  - Use -- to stop flag parsing (e.g. rm -- -filename).
-  - Paths are restricted to your workspace.
-  - Parent traversal outside root is blocked.
-`);
-      break;
-
-    case "pwd": {
-      send("output-success", relativeDisplay(session.rootDir, path.join(session.rootDir, session.cwd)));
-      emitCwd();
-      break;
-    }
-
-    case "ls": {
-      const targetRel = positional[0] || ".";
-      const abs = safeResolve(session.rootDir, session.cwd, targetRel);
-      if (!abs) return send("output-error", "Access denied");
-      try {
-        const stat = await fs.stat(abs);
-        const showAll = flags.has("a") || flags.has("all");
-        const longFmt = flags.has("l") || flags.has("long");
-
-        if (!longFmt) {
-          if (!stat.isDirectory()) {
-            // Just show filename (like simple ls)
-            const base = path.basename(abs);
-            send("output-success", stat.isDirectory() ? base + "/" : base);
-          } else {
-            const names = await fs.readdir(abs, { withFileTypes: true });
-            const filtered = names.filter(d => showAll || !d.name.startsWith("."));
-            const out = filtered
-              .map(d => d.name + (d.isDirectory() ? "/" : ""))
-              .sort((a, b) => a.localeCompare(b));
-            send("output-success", out.join("\n"));
-          }
-        } else {
-          // Long format
-            if (!stat.isDirectory()) {
-            const lines = await listLong(abs, session.rootDir);
-            send("output-success", lines.join("\n"));
-          } else {
-            const entries = await fs.readdir(abs, { withFileTypes: true });
-            const filtered = entries.filter(d => showAll || !d.name.startsWith("."));
-            const lines = [];
-            for (const dirent of filtered) {
-              const entryAbs = path.join(abs, dirent.name);
-              const s = await fs.stat(entryAbs);
-              lines.push(formatLongEntry(entryAbs, s, dirent.isDirectory(), session.rootDir));
-            }
-            lines.sort((a, b) => a.localeCompare(b));
-            send("output-success", lines.join("\n"));
-          }
-        }
-      } catch {
-        send("output-error", "Not found");
-      }
-      break;
-    }
-
-    case "cd": {
-      if (!positional.length) positional.push(".");
-      const targetRel = positional[0];
-      const abs = safeResolve(session.rootDir, session.cwd, targetRel);
-      if (!abs) {
-        send("output-error", "Access denied");
-        break;
-      }
-      try {
-        const stat = await fs.stat(abs);
-        if (!stat.isDirectory()) {
-          send("output-error", "Not a directory");
-          break;
-        }
-        session.cwd = path.relative(session.rootDir, abs) || ".";
-        emitCwd();
-        send("output-success", ""); // empty line like many shells
-      } catch {
-        send("output-error", "Directory not found");
-      }
-      break;
-    }
-
-    case "cat": {
-      if (!positional[0]) {
-        send("output-error", "File required");
-        break;
-      }
-      const abs = safeResolve(session.rootDir, session.cwd, positional[0]);
-      if (!abs) {
-        send("output-error", "Access denied");
-        break;
-      }
-      try {
-        const stat = await fs.stat(abs);
-        if (stat.isDirectory()) {
-          send("output-error", "Is a directory");
-          break;
-        }
-        const data = await readFileSafe(abs);
-        // cat typically outputs without forcing extra newline; keep data as-is
-        socket.emit("output-success", data.endsWith("\n") ? data : data + "\n");
-      } catch {
-        send("output-error", "Cannot read file");
-      }
-      break;
-    }
-
-    case "touch": {
-      if (!positional[0]) {
-        send("output-error", "Filename required");
-        break;
-      }
-      const abs = safeResolve(session.rootDir, session.cwd, positional[0]);
-      if (!abs) {
-        send("output-error", "Access denied");
-        break;
-      }
-      try {
-        await writeFileSafe(abs, "");
-        send("output-success", `Created ${relativeDisplay(session.rootDir, abs)}`);
-      } catch {
-        send("output-error", "Failed to create file");
-      }
-      break;
-    }
-
-    case "mkdir": {
-      if (!positional[0]) {
-        send("output-error", "Directory name required");
-        break;
-      }
-      const abs = safeResolve(session.rootDir, session.cwd, positional[0]);
-      if (!abs) {
-        send("output-error", "Access denied");
-        break;
-      }
-      try {
-        await ensureDir(abs);
-        send("output-success", `Created directory ${relativeDisplay(session.rootDir, abs)}`);
-      } catch {
-        send("output-error", "Failed to create directory");
-      }
-      break;
-    }
-
-    case "rm": {
-      if (!positional.length) {
-        send("output-error", "Path required");
-        break;
-      }
-      const recursive = flags.has("r") || flags.has("R");
-      const force = flags.has("f");
-      const results = [];
-      for (const target of positional) {
-        const abs = safeResolve(session.rootDir, session.cwd, target);
-        if (!abs) {
-          results.push(`rm: ${target}: access denied`);
-          if (!force) break;
-          continue;
-        }
-        const { ok, msg } = await removePath(abs, { recursive, force, rootDir: session.rootDir });
-        const rel = relativeDisplay(session.rootDir, abs);
-        if (!ok && !force) {
-          results.push(`rm: ${rel}: ${msg}`);
-          break;
-        } else {
-          results.push(`rm: ${rel}: ${msg}`);
-        }
-      }
-      send(results.some(r => r.includes("access denied") || r.includes("refusing") || r.includes("error") || r.includes("ENOENT")) ? "output-error" : "output-success", results.join("\n"));
-      break;
-    }
-
-    case "run": {
-      if (positional.length < 2) {
-        send("output-error", "Usage: run <language> <file>");
-        break;
-      }
-      const language = positional[0].toLowerCase();
-      const fileRel = positional.slice(1).join(" ");
-      const abs = safeResolve(session.rootDir, session.cwd, fileRel);
-      if (!abs) {
-        send("output-error", "Access denied");
-        break;
-      }
-      try {
-        const stat = await fs.stat(abs);
-        if (stat.isDirectory()) {
-          send("output-error", "Cannot run a directory");
-          break;
-        }
-      } catch {
-        send("output-error", "File not found");
-        break;
-      }
-
-      try {
-        let cmd, cmdArgs;
-        if (["node", "js", "javascript"].includes(language)) {
-          cmd = "node"; cmdArgs = [abs];
-        } else if (["python", "py", "python3"].includes(language)) {
-          cmd = "python3"; cmdArgs = [abs];
-        } else {
-          send("output-error", "Unsupported language");
-          break;
-        }
-
-        const proc = spawn(cmd, cmdArgs, {
-          cwd: path.dirname(abs),
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 15_000
-        });
-
-        proc.stdout.on("data", d => socket.emit("output-success", d.toString()));
-        proc.stderr.on("data", d => socket.emit("output-error", d.toString()));
-        proc.on("close", codeExit => {
-          send("output-success", `[process exited with code ${codeExit}]`);
-        });
-      } catch (e) {
-        send("output-error", `Execution failed: ${e.message}`);
-      }
-      break;
-    }
-
-    case "clear":
-      // Client usually clears screen locally; send blank line
-      send("output-success", "");
-      break;
-
-    default:
-      send("output-error", `Unknown or disallowed command: ${cmd}\nType 'help' for help.`);
-  }
-}
-
-// ---------- Socket Handling ----------
-io.on("connection", async (socket) => {
-  socket.on("join-user-workspace", async (usernameRaw) => {
-    const username = sanitizeUsername(usernameRaw || "user");
-    const workspaceId = uuidv4().slice(0, 12);
-    const rootDir = path.join(WORKSPACES_BASE, `${username}_${workspaceId}`);
-    await ensureDir(rootDir);
-
-    // Seed minimal files (ignore errors)
-    try {
-      await Promise.all([
-        fs.writeFile(path.join(rootDir, "README.md"),
-`# Workspace
-User: ${username}
-Session: ${workspaceId}
-Created: ${new Date().toISOString()}
-`),
-        fs.writeFile(path.join(rootDir, "hello.js"), `console.log("Hello from ${username}'s workspace");\n`)
-      ]);
-    } catch {}
-
-    sessions.set(socket.id, {
-      username,
-      rootDir,
-      cwd: ".",
-      createdAt: new Date()
-    });
-
-    socket.emit("workspace-ready", {
-      userLogin: username,
-      userDir: rootDir,
-      socketId: socket.id,
-      connectedAt: new Date()
-    });
-
-    socket.emit("cwd-update", { cwd: "." });
-
-    socket.emit("output-success",
-`Welcome ${username}!
-Type 'help' to see available commands.
-Your workspace root is locked to: ${rootDir}
-`);
-  });
-
-  socket.on("input", (rawCommand) => {
-    const session = sessions.get(socket.id);
-    if (!session) {
-      socket.emit("output-error", "Workspace not initialized. Reconnect.\n");
-      return;
-    }
-    handlePseudoShellCommand(socket, session, rawCommand);
-  });
-
-  socket.on("disconnect", async () => {
-    const session = sessions.get(socket.id);
-    if (session) {
-      try {
-        await fs.rm(session.rootDir, { recursive: true, force: true });
-      } catch {}
-      sessions.delete(socket.id);
+app.get("/config", (_req, res) => {
+  res.json({
+    allowlist: getAllowlist(),
+    network: {
+      allowedModes: getAllowedNetworkModes(),
+      defaultMode: getDefaultNetworkMode()
+    },
+    limits: {
+      maxConcurrentSessions: MAX_CONCURRENT_SESSIONS || null,
+      maxSessionsPerUser: MAX_SESSIONS_PER_USER || null,
+      idleMinutes: MAX_IDLE_MINUTES
     }
   });
 });
 
-// ---------- REST: list files for a given socket ----------
-app.get("/api/socket/:socketId/files", async (req, res) => {
-  const sess = sessions.get(req.params.socketId);
-  if (!sess) return res.status(404).json({ error: "Session not found" });
-  const tree = await buildTree(sess.rootDir, sess.rootDir);
-  res.json({ files: tree });
-});
-
-async function buildTree(dir, base) {
-  const out = [];
-  let entries = [];
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const e of entries) {
-    const full = path.join(dir, e.name);
-    const rel = path.relative(base, full);
-    if (e.isDirectory()) {
-      out.push({
-        name: e.name,
-        path: rel,
-        type: "directory",
-        children: await buildTree(full, base)
-      });
-    } else {
-      let stat;
-      try { stat = await fs.stat(full); } catch { continue; }
-      out.push({
-        name: e.name,
-        path: rel,
-        type: "file",
-        size: stat.size,
-        modified: stat.mtime
-      });
-    }
-  }
-  out.sort((a, b) => {
-    if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-  return out;
-}
-
-// ---------- Health ----------
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
-    activeSessions: sessions.size,
-    timestamp: new Date().toISOString()
+    sessions: sessions.size,
+    users: Array.from(userSessionCount.entries())
   });
 });
 
-// ---------- Startup ----------
-server.listen(8080, () => {
-  console.log("Secure pseudo-shell IDE server on 8080");
-  console.log("Workspaces root:", WORKSPACES_BASE);
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: CLIENT_URL, methods: ["GET", "POST"] }
 });
 
-// ---------- Graceful Shutdown ----------
-process.on("SIGTERM", async () => {
-  for (const [, sess] of sessions) {
-    try { await fs.rm(sess.rootDir, { recursive: true, force: true }); } catch {}
+function wrap(socket, event, schema, handler, errorChannel = "terminal:data") {
+  socket.on(event, (raw) => {
+    try {
+      if (!raw || typeof raw !== "object") throw new Error("Payload missing");
+      const payload = validateRequest(schema, raw);
+      handler(payload);
+    } catch {
+      if (errorChannel === "terminal:data") socket.emit("terminal:data", `\r\n[invalid ${event}]\r\n`);
+      else socket.emit(errorChannel, `Invalid ${event}`);
+    }
+  });
+}
+
+/* -------- Resource Guard (optional kill) -------- */
+function attachResourceGuard(session, socket) {
+  if (!RESOURCE_KILL_MEM_PERCENT && !RESOURCE_KILL_CPU_PERCENT) return;
+  session._rg = { cpuHighSince: null, warned: false, graceTimer: null };
+  session._rgTimer = setInterval(() => {
+    if (session.closed) return; // FIX: don't act on closed sessions
+    const stat = session.lastStat;
+    if (!stat) return;
+
+    if (RESOURCE_KILL_MEM_PERCENT && stat.memPercent >= RESOURCE_KILL_MEM_PERCENT) {
+      socket.emit("terminal:data", `\n[resource] memory ${stat.memPercent.toFixed(1)}% >= ${RESOURCE_KILL_MEM_PERCENT}% – terminating\n`);
+      terminateSession(session, socket);
+      return;
+    }
+
+    if (RESOURCE_KILL_CPU_PERCENT && stat.cpuPercent >= RESOURCE_KILL_CPU_PERCENT) {
+      if (!session._rg.cpuHighSince) {
+        session._rg.cpuHighSince = now();
+      } else {
+        const elapsed = now() - session._rg.cpuHighSince;
+        if (elapsed >= RESOURCE_KILL_SUSTAIN_MS && !session._rg.warned) {
+          session._rg.warned = true;
+          socket.emit("terminal:data", `\n[resource] CPU ${stat.cpuPercent.toFixed(1)}% high; terminating in ${(RESOURCE_KILL_GRACE_MS/1000)}s if still high\n`);
+          session._rg.graceTimer = setTimeout(() => {
+            if (session.closed) return;
+            const s2 = session.lastStat;
+            if (s2 && s2.cpuPercent >= RESOURCE_KILL_CPU_PERCENT) {
+              socket.emit("terminal:data", `[resource] CPU still high, terminating\n`);
+              terminateSession(session, socket);
+            } else {
+              session._rg.cpuHighSince = null;
+              session._rg.warned = false;
+              socket.emit("terminal:data", `[resource] CPU normalized\n`);
+            }
+          }, RESOURCE_KILL_GRACE_MS);
+        }
+      }
+    } else {
+      session._rg.cpuHighSince = null;
+      session._rg.warned = false;
+      if (session._rg.graceTimer) {
+        clearTimeout(session._rg.graceTimer);
+        session._rg.graceTimer = null;
+      }
+    }
+  }, RESOURCE_CHECK_INTERVAL_MS);
+}
+
+function detachResourceGuard(session) {
+  if (session._rgTimer) clearInterval(session._rgTimer);
+  if (session._rg?.graceTimer) clearTimeout(session._rg.graceTimer);
+  delete session._rgTimer;
+  delete session._rg;
+}
+
+async function terminateSession(sess, socket) {
+  if (sess.closed) return;          // FIX: idempotency guard
+  sess.closed = true;               // FIX: mark closed early
+  try { if (sess.stopStats) sess.stopStats(); } catch {}
+  try { detachResourceGuard(sess); } catch {}
+  try { await stopAndRemoveContainer(sess.container); } catch {}
+  try { await removeWorkspaceDir(sess.sessionId, sess.username); } catch {}
+  sessions.delete(sess.socketId);
+  decUser(sess.username);
+  socket.emit("terminal:exit", { code: 137, signal: null });
+}
+
+/* ---------------- Socket: Connection ---------------- */
+io.on("connection", (socket) => {
+  if (DEBUG_SANDBOX) console.log("[socket] connect", socket.id);
+
+  socket.on("workspace:init", async (raw) => {
+    if (SANDBOX_MODE !== "container") {
+      socket.emit("workspace:error", "Sandbox mode disabled");
+      return;
+    }
+
+    const tracker = socketInitTracker.get(socket.id) || { count: 0, windowStart: now() };
+    const elapsed = now() - tracker.windowStart;
+    if (elapsed > SOCKET_INIT_RATE_WINDOW_MS) {
+      tracker.count = 0;
+      tracker.windowStart = now();
+    }
+    tracker.count += 1;
+    socketInitTracker.set(socket.id, tracker);
+    if (tracker.count > SOCKET_INIT_MAX) {
+      socket.emit("workspace:error", "Too many initialization attempts");
+      return;
+    }
+
+    let payload;
+    try {
+      if (!raw || typeof raw !== "object") throw new Error("Missing");
+      payload = validateRequest(initSchema, raw);
+    } catch {
+      socket.emit("workspace:error", "Invalid init request");
+      return;
+    }
+
+    const user = sanitizeUsername(payload.username);
+    if (MAX_CONCURRENT_SESSIONS && sessions.size >= MAX_CONCURRENT_SESSIONS) {
+      socket.emit("workspace:error", "Global session limit reached");
+      return;
+    }
+    if (MAX_SESSIONS_PER_USER && userCount(user) >= MAX_SESSIONS_PER_USER) {
+      socket.emit("workspace:error", "User session quota exceeded");
+      return;
+    }
+
+    const sessionId = `${user}_${uuidv4().slice(0, 12)}`;
+
+    try {
+      const { container, exec, stream, workspaceDir, baseImage, networkMode } =
+        await createSessionExecShell({ sessionId, username: user });
+
+      const sessionToken = deriveSessionToken(SERVER_INSTANCE_SECRET, sessionId, socket.id);
+      const sess = {
+        socketId: socket.id,
+        sessionId,
+        username: user,
+        container,
+        exec,
+        stream,
+        workspaceDir,
+        baseImage,
+        networkMode,
+        createdAt: now(),
+        lastActivity: now(),
+        inputTokens: INPUT_BURST_BYTES,
+        lastRefill: now(),
+        stopStats: null,
+        sessionToken,
+        lastStat: null,
+        closed: false          // FIX: track lifecycle
+      };
+      sessions.set(socket.id, sess);
+      incUser(user);
+
+      stream.on("data", chunk => {
+        if (!sess.closed) socket.emit("terminal:data", chunk.toString("utf8"));
+      });
+
+      // FIX: When shell ends, terminate the whole session (cleans container)
+      stream.on("end", () => {
+        if (!sess.closed) terminateSession(sess, socket);
+      });
+      stream.on("error", err => {
+        if (!sess.closed) {
+          socket.emit("terminal:data", `\r\n[stream error: ${err.message}]\r\n`);
+          terminateSession(sess, socket); // FIX
+        }
+      });
+
+      socket.emit("workspace:ready", {
+        user,
+        sessionId,
+        mode: "container",
+        baseImage,
+        networkMode,
+        cwd: "/workspace",
+        host: os.hostname(),
+        token: sessionToken,
+        limits: { idleMinutes: MAX_IDLE_MINUTES }
+      });
+
+      attachResourceGuard(sess, socket);
+
+    } catch (e) {
+      if (DEBUG_SANDBOX) console.error("[init error]", e);
+      socket.emit("workspace:error", "Failed to start session: " + (e?.message || "unknown"));
+    }
+  });
+
+  wrap(socket, "terminal:input", inputSchema, (p) => {
+    const sess = sessions.get(socket.id); if (!sess || sess.closed) return;
+    if (!verifySessionToken(SERVER_INSTANCE_SECRET, p.token, sess.sessionId, socket.id)) return;
+    if (p.sessionId !== sess.sessionId) return;
+    sess.lastActivity = now();
+    refillTokens(sess);
+    const bytes = Buffer.byteLength(p.data);
+    if (sess.inputTokens < bytes) {
+      socket.emit("terminal:data", "\r\n[input throttled]\r\n");
+      return;
+    }
+    sess.inputTokens -= bytes;
+    try { if (!sess.closed) sess.stream.write(p.data); } catch {}
+  });
+
+  wrap(socket, "terminal:resize", resizeSchema, (p) => {
+    const sess = sessions.get(socket.id); if (!sess || sess.closed) return;
+    if (!verifySessionToken(SERVER_INSTANCE_SECRET, p.token, sess.sessionId, socket.id)) return;
+    if (p.sessionId !== sess.sessionId) return;
+    resizeExecTTY(sess.container, sess.exec, { cols: p.cols, rows: p.rows });
+  });
+
+  wrap(socket, "terminal:kill", killSchema, (p) => {
+    const sess = sessions.get(socket.id); if (!sess || sess.closed) return;
+    if (!verifySessionToken(SERVER_INSTANCE_SECRET, p.token, sess.sessionId, socket.id)) return;
+    if (p.sessionId !== sess.sessionId) return;
+    terminateSession(sess, socket);
+  });
+
+  wrap(socket, "stats:subscribe", statsSubscribeSchema, (p) => {
+    const sess = sessions.get(socket.id); if (!sess || sess.closed) return;
+    if (!verifySessionToken(SERVER_INSTANCE_SECRET, p.token, sess.sessionId, socket.id)) return;
+    if (p.sessionId !== sess.sessionId) return;
+    if (sess.stopStats) return;
+    const stop = startStatsStream(sess, stat => {
+      if (sess.closed) return;
+      sess.lastStat = stat;
+      socket.emit("stats:tick", stat);
+    }, () => {});
+    sess.stopStats = stop;
+  }, "workspace:error");
+
+  wrap(socket, "stats:unsubscribe", statsUnsubscribeSchema, (p) => {
+    const sess = sessions.get(socket.id); if (!sess || sess.closed) return;
+    if (!verifySessionToken(SERVER_INSTANCE_SECRET, p.token, sess.sessionId, socket.id)) return;
+    if (p.sessionId !== sess.sessionId) return;
+    if (sess.stopStats) { try { sess.stopStats(); } catch {} sess.stopStats = null; }
+  }, "workspace:error");
+
+  socket.on("disconnect", async () => {
+    const sess = sessions.get(socket.id);
+    if (sess && !sess.closed) {
+      await terminateSession(sess, socket);
+    }
+  });
+});
+
+/* ---------------- Idle Cleanup ---------------- */
+const MAX_IDLE_MS = MAX_IDLE_MINUTES * 60 * 1000;
+setInterval(async () => {
+  const cutoff = now() - MAX_IDLE_MS;
+  for (const [sid, sess] of sessions) {
+    if (sess.closed) continue;
+    if (sess.lastActivity < cutoff) {
+      const sock = io.sockets.sockets.get(sid);
+      if (sock) {
+        await terminateSession(sess, sock);
+      } else {
+        // Fallback
+        sess.closed = true;
+        try { if (sess.stopStats) sess.stopStats(); } catch {}
+        try { await stopAndRemoveContainer(sess.container); } catch {}
+        try { await removeWorkspaceDir(sess.sessionId, sess.username); } catch {}
+        sessions.delete(sid);
+        decUser(sess.username);
+      }
+    }
   }
-  process.exit(0);
+}, CLEAN_INTERVAL_SECONDS * 1000);
+
+/* ---------------- Errors & Start ---------------- */
+process.on("uncaughtException", e => console.error("[uncaughtException]", e));
+process.on("unhandledRejection", r => console.error("[unhandledRejection]", r));
+
+httpServer.listen(PORT, () => {
+  console.log(`Minimal DevSpace server listening on ${PORT} (auto-clean on shell exit)`);
 });

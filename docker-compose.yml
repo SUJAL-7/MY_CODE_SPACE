@@ -1,16 +1,71 @@
-services:
-  client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    depends_on:
-      - server
+version: "3.9"
 
+services:
   server:
     build:
       context: ./server
       dockerfile: Dockerfile
+    environment:
+      # Core
+      SANDBOX_MODE: container
+      WORKSPACES_ROOT: /workspaces
+
+      # Image & network
+      FORCED_BASE_IMAGE: ubuntu:22.04
+      ALLOWLIST_IMAGES: ubuntu:22.04
+      DIGEST_REQUIRED: "false"
+      FORCED_NETWORK_MODE: bridge
+
+      # Runtime resources
+      READONLY_ROOT: "false"          # user can apt install
+      SANDBOX_MEMORY: 1g
+      SANDBOX_CPUS: "1.0"
+      SANDBOX_AUTOREMOVE: "true"
+
+      # Security / capabilities
+      RETAIN_CAP_DROP_ALL: "1"
+      ALLOWED_EXTRA_CAPS: ""          # set RETAIN_CAP_DROP_ALL=0 and add caps if you need them
+
+      # Session limits
+      MAX_CONCURRENT_SESSIONS: 20
+      MAX_SESSIONS_PER_USER: 3
+      MAX_IDLE_MINUTES: 120
+      CLEAN_INTERVAL_SECONDS: 60
+
+      # Input throttling
+      INPUT_MAX_TOKENS_PER_SEC: 8000
+      INPUT_BURST_BYTES: 16000
+
+      # Resource guard (set to 0 to disable)
+      RESOURCE_KILL_MEM_PERCENT: "90"
+      RESOURCE_KILL_CPU_PERCENT: "350"
+      RESOURCE_KILL_SUSTAIN_MS: "20000"
+      RESOURCE_KILL_GRACE_MS: "5000"
+      RESOURCE_CHECK_INTERVAL_MS: "2000"
+
+      # Client + debug
+      CLIENT_URL: http://localhost:3000
+      DEBUG_SANDBOX: "0"
+      SANDBOX_NPM_PROGRESS: "0"
+
+      # Secret (replace!)
+      SERVER_INSTANCE_SECRET: "REPLACE_WITH_RANDOM_32B_HEX"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - server_workspaces:/workspaces
     ports:
       - "8080:8080"
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    environment:
+      - VITE_SERVER_URL=http://server:8080
+    depends_on:
+      - server
+    ports:
+      - "3000:3000"
+
+volumes:
+  server_workspaces:

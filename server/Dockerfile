@@ -1,26 +1,29 @@
-FROM ubuntu:20.04
+FROM node:20-bullseye
 
-RUN apt-get update &&\
-    DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata
-
-RUN apt-get install -y sudo
-RUN apt-get install -y curl
-RUN curl -fsSL https://deb.nodesource.com/setup_current.x | sudo -E bash -
-RUN sudo apt install -y nodejs
-
-RUN apt-get install -y python3
-RUN apt-get install -y pip
-
-RUN npm install -g typescript
-
+# Install minimal extras (git optional if you want git in orchestrator only)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates git python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY package.json .
-RUN npm install
+COPY package*.json ./
+RUN npm install --no-audit --no-fund
 
 COPY . .
 
-EXPOSE 8080
+ENV NODE_ENV=production \
+    SANDBOX_MODE=container \
+    WORKSPACES_ROOT=/workspaces \
+    SANDBOX_BASE_IMAGE=node:20-bullseye \
+    SANDBOX_MEMORY=512m \
+    SANDBOX_CPUS=1.0 \
+    SANDBOX_NETWORK_MODE=none \
+    SANDBOX_AUTOREMOVE=true
 
-CMD ["node", "index.js"]
+# Workspace root on orchestrator container (host binds used inside user containers)
+RUN mkdir -p /workspaces
+
+EXPOSE 8080
+CMD ["node","index.js"]

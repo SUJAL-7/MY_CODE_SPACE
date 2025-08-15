@@ -1,13 +1,38 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef } from "react";
 import Editor from "@monaco-editor/react";
-import useFileReader from "../../hooks/file-reader/useFileReader";
 
-const CodeEditor = ({ code, setCode, language }) => {
-  const { readBoilerFile } = useFileReader();
+/**
+ * Props:
+ *  code, setCode         - controlled content
+ *  editorLanguage        - monaco language id (e.g. javascript, python)
+ *  openFilePath          - current file path (for tab/status)
+ *  onChangeCode          - optional separate callback
+ *  enableAutosave        - boolean
+ *  onDirtyChange         - callback(dirty:boolean)
+ *  onAutosave            - callback(content)
+ *  autosaveDelay         - ms (default 800)
+ */
+const CodeEditor = ({
+  code,
+  setCode,
+  editorLanguage = "plaintext",
+  openFilePath,
+  onChangeCode,
+  enableAutosave = true,
+  onDirtyChange,
+  onAutosave,
+  autosaveDelay = 800
+}) => {
+  const monacoRef = useRef(null);
+  const dirtyRef = useRef(false);
+  const autosaveTimer = useRef(null);
+  const lastSavedContent = useRef(code);
 
   useEffect(() => {
-    readBoilerFile(language, setCode);
-  }, [language]);
+    lastSavedContent.current = code;
+    dirtyRef.current = false;
+    onDirtyChange && onDirtyChange(false);
+  }, [openFilePath]); // when file changes, reset dirty tracking
 
   const setEditorTheme = (monaco) => {
     monaco.editor.defineTheme("customTheme", {
@@ -15,49 +40,60 @@ const CodeEditor = ({ code, setCode, language }) => {
       inherit: true,
       rules: [],
       colors: {
-        "editor.background": "#1f1f1f",
-      },
+        "editor.background": "#1f1f1f"
+      }
     });
   };
 
-  const getLanguage = (lang) => {
-    switch (lang) {
-      case "C++":
-        return "cpp";
-      case "JavaScript":
-        return "javascript";
-      case "TypeScript":
-        return "typescript";
-      case "Python":
-        return "python";
-      default:
-        return "plaintext";
+  const handleChange = (value) => {
+    setCode(value ?? "");
+    onChangeCode && onChangeCode(value ?? "");
+    if (enableAutosave) {
+      if (value !== lastSavedContent.current) {
+        if (!dirtyRef.current) {
+          dirtyRef.current = true;
+          onDirtyChange && onDirtyChange(true);
+        }
+        clearTimeout(autosaveTimer.current);
+        autosaveTimer.current = setTimeout(() => {
+          if (onAutosave) {
+            onAutosave(value ?? "");
+            lastSavedContent.current = value ?? "";
+            dirtyRef.current = false;
+            onDirtyChange && onDirtyChange(false);
+          }
+        }, autosaveDelay);
+      } else {
+        if (dirtyRef.current) {
+          dirtyRef.current = false;
+          onDirtyChange && onDirtyChange(false);
+        }
+      }
     }
   };
 
   return (
-    <>
-      <Editor
-        beforeMount={setEditorTheme}
-        language={getLanguage(language)}
-        height={"94vh"}
-        theme="customTheme"
-        value={code}
-        onChange={(value) => setCode(value)}
-        options={{
-          inlineSuggest: true,
-          fontSize: 14,
-          // readOnlyMessage: { value: "Read only editor" },
-          formatOnType: true,
-          autoClosingBrackets: "always",
-          // readOnly: true,
-          minimap: { enabled: false },
-          padding: {
-            top: 10,
-          },
-        }}
-      />
-    </>
+    <Editor
+      beforeMount={setEditorTheme}
+      onMount={(editor, monaco) => {
+        monacoRef.current = editor;
+      }}
+      language={editorLanguage}
+      height={"calc(100vh - 40px)"} // adjust for header bar
+      theme="customTheme"
+      value={code}
+      onChange={handleChange}
+      options={{
+        inlineSuggest: true,
+        fontSize: 14,
+        formatOnType: true,
+        autoClosingBrackets: "always",
+        minimap: { enabled: false },
+        padding: { top: 10 },
+        scrollBeyondLastLine: false,
+        smoothScrolling: true
+      }}
+    />
   );
 };
 
