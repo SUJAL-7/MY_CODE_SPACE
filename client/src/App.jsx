@@ -1,32 +1,36 @@
-import React, { useState } from "react";
+import { useState, useCallback } from "react";
 import TerminalView from "./components/terminal/TerminalView";
+import FileExplorer from "./components/files/FileExplorer";
 
-// Placeholder future components (Explorer, Editor, etc.)
+/**
+ * Layout:
+ *  - Left: File Explorer (with internal editor)
+ *  - Right: Terminal
+ *
+ * Terminal establishes the session; when ready it passes sessionId/token up.
+ * FileExplorer then uses the session to perform file operations.
+ */
 const App = () => {
-  const [username] = useState("user"); // Replace with real auth user if available.
+  const [username] = useState("user");
+  const [sessionInfo, setSessionInfo] = useState(null);
+
+  const handleSessionInfo = useCallback((info) => {
+    setSessionInfo(info);
+  }, []);
 
   return (
     <div className="w-screen h-screen flex flex-row overflow-hidden font-sans">
-      {/* Sidebar */}
-      <div className="bg-[#181818] text-neutral-300 w-52 p-3 text-xs border-r border-neutral-700 flex flex-col gap-2">
-        <div className="font-semibold tracking-wide">Sidebar</div>
-        <div>Explorer (todo)</div>
-        <div>Editor (todo)</div>
+      {/* File Explorer Panel */}
+      <div className="h-full flex-shrink-0">
+        <FileExplorer session={sessionInfo} collapsed={false} />
       </div>
 
-      {/* Editor placeholder */}
-      <div className="flex flex-col flex-1 border-r border-neutral-700">
-        <div className="px-3 py-2 text-xs bg-[#202020] text-neutral-400 border-b border-neutral-700">
-          Editor Panel (coming soon)
-        </div>
-        <div className="flex-1 flex items-center justify-center text-neutral-600 text-sm">
-          Add file explorer & editor integration next.
-        </div>
-      </div>
+      {/* Resize handle placeholder (optional future drag) */}
+      <div className="w-[4px] bg-neutral-800 cursor-col-resize" />
 
       {/* Terminal */}
-      <div className="flex" style={{ width: "40%" }}>
-        <TerminalView username={username} />
+      <div className="flex-1 min-w-0 flex">
+        <TerminalView username={username} onSessionInfo={handleSessionInfo} />
       </div>
     </div>
   );

@@ -10,15 +10,20 @@ function debounce(fn, ms) {
   let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
 }
 
-export default function TerminalView({ username }) {
+/**
+ * Pure terminal component (no embedded file explorer).
+ * Emits session info upward via onSessionInfo once ready / changes.
+ */
+export default function TerminalView({ username, onSessionInfo }) {
   const termRef = useRef(null);
   const fitRef = useRef(null);
   const searchRef = useRef(null);
   const containerRef = useRef(null);
 
   const sessionRef = useRef({ sessionId: null, token: null, ready: false });
-  const [status, setStatus] = useState("connecting"); // connecting | ready | error | disconnected | exited
+  const [status, setStatus] = useState("connecting");
   const [errorMsg, setErrorMsg] = useState("");
+
   const statsSubscribedRef = useRef(false);
   const pendingSizeRef = useRef({ cols: 80, rows: 24 });
 
@@ -65,9 +70,19 @@ export default function TerminalView({ username }) {
     const term = termRef.current;
     if (!term) return;
 
+    const propagate = (info) => {
+      onSessionInfo?.(info);
+    };
+
     const onReady = info => {
       sessionRef.current = { sessionId: info.sessionId, token: info.token, ready: true };
       setStatus("ready");
+      propagate({
+        sessionId: info.sessionId,
+        token: info.token,
+        ready: true,
+        baseImage: info.baseImage
+      });
       // Resize once ready
       emitWithSession("terminal:resize", pendingSizeRef.current);
       if (!statsSubscribedRef.current) {
@@ -84,12 +99,15 @@ export default function TerminalView({ username }) {
       setStatus("error");
       setErrorMsg(msg);
       term.write(`\r\n[workspace error] ${msg}\r\n`);
+      sessionRef.current.ready = false;
+      propagate({ ...sessionRef.current });
     };
 
     const onExit = ({ code }) => {
       term.write(`\r\n[session exited code=${code}]\r\n`);
       setStatus("exited");
       sessionRef.current.ready = false;
+      propagate({ ...sessionRef.current });
     };
 
     const onDisconnect = reason => {
@@ -98,6 +116,7 @@ export default function TerminalView({ username }) {
         setStatus("disconnected");
       }
       sessionRef.current.ready = false;
+      propagate({ ...sessionRef.current });
     };
 
     socket.on("workspace:ready", onReady);
@@ -113,7 +132,7 @@ export default function TerminalView({ username }) {
       socket.off("terminal:exit", onExit);
       socket.off("disconnect", onDisconnect);
     };
-  }, [status]);
+  }, [status, onSessionInfo]);
 
   // Terminal input
   useEffect(() => {
@@ -170,20 +189,20 @@ export default function TerminalView({ username }) {
         <span className="px-2 py-[2px] rounded bg-neutral-600">{status.toUpperCase()}</span>
         <div className="ml-auto flex gap-1">
           {status === "ready" && (
-            <button
-              onClick={() => termRef.current?.clear()}
-              className="px-2 py-[3px] bg-neutral-600 hover:bg-neutral-500 rounded text-[11px]"
-            >
-              Clear
-            </button>
-          )}
-          {status === "ready" && (
-            <button
-              onClick={killSession}
-              className="px-2 py-[3px] bg-red-600 hover:bg-red-700 rounded text-[11px]"
-            >
-              Kill
-            </button>
+            <>
+              <button
+                onClick={() => termRef.current?.clear()}
+                className="px-2 py-[3px] bg-neutral-600 hover:bg-neutral-500 rounded text-[11px]"
+              >
+                Clear
+              </button>
+              <button
+                onClick={killSession}
+                className="px-2 py-[3px] bg-red-600 hover:bg-red-700 rounded text-[11px]"
+              >
+                Kill
+              </button>
+            </>
           )}
           <button
             onClick={resetSession}

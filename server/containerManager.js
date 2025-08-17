@@ -1,9 +1,7 @@
 /**
- * Minimal DevSpace Container Manager
- * - No init tasks or pre-installation
- * - Silent startup (no banner)
- * - Writable rootfs so user can install what they want
- * - Capability drop (ALL) by default for safety
+ * Minimal Container Manager with optional host workspace binding.
+ * If USE_HOST_WORKSPACE=false, no host bind is mounted; workspace is ephemeral inside container FS.
+ * Added: startStatsStream / stopStatsStream exports (fix for missing export error).
  */
 
 import Docker from "dockerode";
@@ -14,18 +12,15 @@ import crypto from "crypto";
 
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET || "/var/run/docker.sock" });
 
-/* ---------------- Configuration ---------------- */
 const WORKSPACES_ROOT = process.env.WORKSPACES_ROOT || path.join(process.cwd(), "workspaces");
-
 const FORCED_BASE_IMAGE = (process.env.FORCED_BASE_IMAGE || "ubuntu:22.04").trim();
 const ALLOWLIST_IMAGES = (process.env.ALLOWLIST_IMAGES || FORCED_BASE_IMAGE)
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-const DIGEST_REQUIRED = (process.env.DIGEST_REQUIRED || "false") === "true";
+  .split(",").map(s => s.trim()).filter(Boolean);
 
+const DIGEST_REQUIRED = (process.env.DIGEST_REQUIRED || "false") === "true";
 const NETWORK_MODE = process.env.FORCED_NETWORK_MODE || "bridge";
-const READONLY_ROOT = (process.env.READONLY_ROOT || "false") === "true"; // we default to writable for user installs
+
+const READONLY_ROOT = (process.env.READONLY_ROOT || "false") === "true";
 const SANDBOX_MEMORY = process.env.SANDBOX_MEMORY || "1g";
 const SANDBOX_CPUS = process.env.SANDBOX_CPUS || "1.0";
 const SANDBOX_AUTOREMOVE = process.env.SANDBOX_AUTOREMOVE !== "false";
@@ -34,19 +29,17 @@ const SANDBOX_RUNTIME = process.env.SANDBOX_RUNTIME || "";
 const RETAIN_CAP_DROP_ALL = (process.env.RETAIN_CAP_DROP_ALL || "1") === "1";
 const ALLOWED_EXTRA_CAPS = (process.env.ALLOWED_EXTRA_CAPS || "").split(/\s+/).filter(Boolean);
 
-const DEBUG_SANDBOX = process.env.DEBUG_SANDBOX === "1";
-const SANDBOX_NPM_PROGRESS = (process.env.SANDBOX_NPM_PROGRESS || "0") === "1";
-
 const UID = process.env.SANDBOX_USER_UID || "";
 const GID = process.env.SANDBOX_USER_GID || "";
-const PERSIST_WORKSPACE_PER_USER = (process.env.PERSIST_WORKSPACE_PER_USER || "0") === "1";
+const DEBUG_SANDBOX = process.env.DEBUG_SANDBOX === "1";
 
-/* --------------- Exports for config endpoint --------------- */
+const USE_HOST_WORKSPACE = (process.env.USE_HOST_WORKSPACE || "false") === "true";
+const WORKSPACE_PATH = process.env.WORKSPACE_PATH || "/workspace";
+
 export function getAllowlist() { return ALLOWLIST_IMAGES; }
 export function getAllowedNetworkModes() { return [NETWORK_MODE]; }
 export function getDefaultNetworkMode() { return NETWORK_MODE; }
 
-/* ---------------- Utilities ---------------- */
 function logDebug(...a) { if (DEBUG_SANDBOX) console.log("[containerManager]", ...a); }
 
 function imageAllowed(img) {
@@ -56,16 +49,13 @@ function imageAllowed(img) {
 }
 
 export async function ensureWorkspaceRoot() {
-  if (!fsSync.existsSync(WORKSPACES_ROOT)) {
+  if (USE_HOST_WORKSPACE && !fsSync.existsSync(WORKSPACES_ROOT)) {
     fsSync.mkdirSync(WORKSPACES_ROOT, { recursive: true, mode: 0o750 });
   }
 }
 
-function sessionWorkspaceDir(sessionId, username) {
-  if (!PERSIST_WORKSPACE_PER_USER) return path.join(WORKSPACES_ROOT, sessionId);
-  const userRoot = path.join(WORKSPACES_ROOT, username);
-  if (!fsSync.existsSync(userRoot)) fsSync.mkdirSync(userRoot, { recursive: true, mode: 0o750 });
-  return path.join(userRoot, sessionId);
+function sessionWorkspaceDir(sessionId) {
+  return path.join(WORKSPACES_ROOT, sessionId);
 }
 
 function parseMemory(mem) {
@@ -99,44 +89,26 @@ async function pullImageIfNeeded(image) {
   }
 }
 
-/* ---------------- Main: createSessionExecShell ---------------- */
 export async function createSessionExecShell({ sessionId, username }) {
   const baseImage = FORCED_BASE_IMAGE;
   if (!imageAllowed(baseImage)) throw new Error("Forced base image not allowed");
   await pullImageIfNeeded(baseImage);
 
-  const workspaceDir = sessionWorkspaceDir(sessionId, username);
-  if (!fsSync.existsSync(workspaceDir)) fsSync.mkdirSync(workspaceDir, { recursive: true, mode: 0o750 });
-
-  // Basic npm caches only (optional)
-  const npmCacheDir = path.join(workspaceDir, ".npm");
-  const npmPrefixDir = path.join(workspaceDir, ".npm-global");
-  for (const d of [npmCacheDir, npmPrefixDir]) {
-    if (!fsSync.existsSync(d)) fsSync.mkdirSync(d, { recursive: true, mode: 0o750 });
+  let hostDir = null;
+  const binds = [];
+  if (USE_HOST_WORKSPACE) {
+    hostDir = sessionWorkspaceDir(sessionId);
+    if (!fsSync.existsSync(hostDir)) fsSync.mkdirSync(hostDir, { recursive: true, mode: 0o750 });
+    binds.push(`${hostDir}:${WORKSPACE_PATH}:rw`);
   }
 
-  const npmrcPath = path.join(workspaceDir, ".npmrc");
-  if (!fsSync.existsSync(npmrcPath)) {
-    await fs.writeFile(
-      npmrcPath,
-      `cache=${npmCacheDir}
-prefix=${npmPrefixDir}
-fund=false
-update-notifier=false
-progress=${SANDBOX_NPM_PROGRESS ? "true" : "false"}
-audit=false
-`
-    );
-  }
-
-  // HostConfig
   const HostConfig = {
     AutoRemove: SANDBOX_AUTOREMOVE,
-    Binds: [`${workspaceDir}:/workspace:rw`],
     NetworkMode: NETWORK_MODE,
     ReadonlyRootfs: READONLY_ROOT,
     SecurityOpt: ["no-new-privileges:true"]
   };
+  if (binds.length) HostConfig.Binds = binds;
   if (RETAIN_CAP_DROP_ALL) {
     HostConfig.CapDrop = ["ALL"];
   } else if (ALLOWED_EXTRA_CAPS.length) {
@@ -152,15 +124,9 @@ audit=false
     "LANG=C.UTF-8",
     "LC_ALL=C.UTF-8",
     "TERM=xterm-256color",
-    "WORKSPACE_DIR=/workspace",
-    "HOME=/root",
+    `WORKSPACE_DIR=${WORKSPACE_PATH}`,
+    `DEVSPACE_SESSION_ID=${sessionId}`,
     `DEVSPACE_USER=${username}`,
-    `NPM_CONFIG_CACHE=${npmCacheDir}`,
-    `NPM_CONFIG_PREFIX=${npmPrefixDir}`,
-    "NPM_CONFIG_FUND=false",
-    "NPM_CONFIG_UPDATE_NOTIFIER=false",
-    `NPM_CONFIG_PROGRESS=${SANDBOX_NPM_PROGRESS ? "true" : "false"}`,
-    "NPM_CONFIG_AUDIT=false"
   ];
 
   const createOpts = {
@@ -168,38 +134,69 @@ audit=false
     Tty: false,
     OpenStdin: false,
     Cmd: ["sleep", "infinity"],
-    WorkingDir: "/workspace",
+    WorkingDir: WORKSPACE_PATH,
     HostConfig,
     Env: baseEnv,
     Labels: {
       "devspace.session": sessionId,
       "devspace.user": username,
-      "devspace.image": baseImage
+      "devspace.image": baseImage,
+      "devspace.use_host_workspace": String(USE_HOST_WORKSPACE)
     }
   };
   if (UID) createOpts.User = GID ? `${UID}:${GID}` : UID;
 
-  logDebug("Creating container", { sessionId, baseImage, READONLY_ROOT });
+  logDebug("Creating container", { sessionId, baseImage, USE_HOST_WORKSPACE });
 
   const container = await docker.createContainer(createOpts);
   await container.start();
 
-  // Interactive exec (no banner, no extra output)
+  // Ensure workspace dir exists (ephemeral case)
+  if (!USE_HOST_WORKSPACE) {
+    try {
+      await execCapture(container, `bash -lc 'mkdir -p "${escapeBash(WORKSPACE_PATH)}"'`);
+    } catch {}
+  }
+
   const exec = await container.exec({
     Cmd: ["/bin/bash", "--login"],
     AttachStdin: true,
     AttachStdout: true,
     AttachStderr: true,
     Tty: true,
-    WorkingDir: "/workspace",
+    WorkingDir: WORKSPACE_PATH,
     Env: baseEnv
   });
   const stream = await exec.start({ hijack: true, stdin: true });
 
-  return { container, exec, stream, workspaceDir, baseImage, networkMode: NETWORK_MODE };
+  return {
+    container,
+    exec,
+    stream,
+    workspaceDir: hostDir || null,
+    baseImage,
+    networkMode: NETWORK_MODE
+  };
 }
 
-/* ---------------- Resize / Cleanup / Stats ---------------- */
+async function execCapture(container, cmd) {
+  const exec = await container.exec({
+    Cmd: ["bash", "-lc", cmd],
+    AttachStdout: true,
+    AttachStderr: true,
+    Tty: false
+  });
+  return new Promise((resolve, reject) => {
+    exec.start((err, stream) => {
+      if (err) return reject(err);
+      let data = "";
+      stream.on("data", d => { data += d.toString("utf8"); });
+      stream.on("error", reject);
+      stream.on("end", () => resolve(data));
+    });
+  });
+}
+
 export async function resizeExecTTY(container, exec, { cols, rows }) {
   try {
     await docker.modem.post(
@@ -219,17 +216,14 @@ export async function stopAndRemoveContainer(container) {
   } catch {}
 }
 
-export async function removeWorkspaceDir(sessionId, username) {
+export async function removeWorkspaceDir(sessionId) {
+  if (!USE_HOST_WORKSPACE) return;
   try {
-    if (PERSIST_WORKSPACE_PER_USER) {
-      // If in future you persist per user, adjust removal here
-      await fs.rm(path.join(WORKSPACES_ROOT, sessionId), { recursive: true, force: true });
-    } else {
-      await fs.rm(path.join(WORKSPACES_ROOT, sessionId), { recursive: true, force: true });
-    }
+    await fs.rm(sessionWorkspaceDir(sessionId), { recursive: true, force: true });
   } catch {}
 }
 
+/* ---------------- Stats Streaming (re-added) ---------------- */
 export function startStatsStream(session, onStat, onEnd) {
   const { container } = session;
   let closed = false;
@@ -239,12 +233,12 @@ export function startStatsStream(session, onStat, onEnd) {
     s.on("data", (chunk) => {
       try {
         const obj = JSON.parse(chunk.toString("utf8"));
-        const cpuDelta = obj.cpu_stats.cpu_usage.total_usage - obj.precpu_stats.cpu_usage.total_usage;
-        const sysDelta = obj.cpu_stats.system_cpu_usage - obj.precpu_stats.system_cpu_usage;
+        const cpuDelta = obj.cpu_stats?.cpu_usage?.total_usage - obj.precpu_stats?.cpu_usage?.total_usage;
+        const sysDelta = obj.cpu_stats?.system_cpu_usage - obj.precpu_stats?.system_cpu_usage;
         let cpuPercent = 0;
         if (cpuDelta > 0 && sysDelta > 0) {
-          const cores = obj.cpu_stats.online_cpus || obj.cpu_stats.cpu_usage.percpu_usage?.length || 1;
-          cpuPercent = (cpuDelta / sysDelta) * cores * 100;
+          const cores = obj.cpu_stats?.online_cpus || obj.cpu_stats?.cpu_usage?.percpu_usage?.length || 1;
+            cpuPercent = (cpuDelta / sysDelta) * cores * 100;
         }
         const memUsed = obj.memory_stats?.usage || 0;
         const memLimit = obj.memory_stats?.limit || 1;
@@ -274,6 +268,11 @@ export function stopStatsStream(session) {
   } catch {}
 }
 
+/* ---------------- Utility ---------------- */
 export function randomId(bytes = 8) {
   return crypto.randomBytes(bytes).toString("hex");
+}
+
+function escapeBash(p) {
+  return p.replace(/(["`$\\])/g, "\\$1");
 }
