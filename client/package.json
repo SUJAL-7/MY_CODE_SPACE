@@ -12,6 +12,7 @@
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
     "@radix-ui/react-context-menu": "^2.1.5",
+    "ansi-to-html": "^0.7.2",
     "axios": "^1.7.2",
     "classnames": "^2.5.1",
     "lucide-react": "^0.446.0",
