@@ -10,6 +10,8 @@ import {
   getSession,
   findSessionBySessionId,
   forEachSession,
+  markSessionActivity,
+  setSessionPingSent,
 } from "./sessionManager.js";
 import {
   createSessionExecShell,
@@ -56,6 +58,14 @@ const DEBUG_SANDBOX = process.env.DEBUG_SANDBOX === "1";
 const SANDBOX_MODE = process.env.SANDBOX_MODE || "container";
 const SOCKET_INIT_RATE_WINDOW_MS = parseInt(process.env.SOCKET_INIT_RATE_WINDOW_MS || "60000", 10);
 const SOCKET_INIT_MAX = parseInt(process.env.SOCKET_INIT_MAX || "10", 10);
+// New idle timing envs
+const SESSION_IDLE_MAX_MS = parseInt(process.env.SESSION_IDLE_MAX_MS || "600000", 10);          // 10 min
+const SESSION_IDLE_PING_MS = parseInt(process.env.SESSION_IDLE_PING_MS || "480000", 10);        // 8 min
+const SESSION_IDLE_PING_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_PING_TIMEOUT_MS || "120000", 10); // 2 min
+
+
+const _safePingMs = Math.min(SESSION_IDLE_PING_MS, SESSION_IDLE_MAX_MS - 60000); // guard if misconfigured
+
 
 const socketInitTracker = new Map();
 const downloadTokenMap = new Map();
@@ -419,6 +429,27 @@ export function setupSocketHandlers(io) {
       }
     });
 
+    // Mark activity for any meaningful event (filter very noisy ones if needed)
+    socket.onAny((eventName) => {
+      if (
+        eventName === "session:ping" ||
+        eventName === "session:pong" ||
+        eventName.startsWith("stats:") ||
+        eventName === "terminal:data"
+      ) return;
+      const sess = getSession(socket.id);
+      if (sess) markSessionActivity(sess);
+    });
+
+    socket.on("session:pong", () => {
+      const sess = getSession(socket.id);
+      if (sess) {
+        markSessionActivity(sess);
+        socket.emit("terminal:data", "[session] pong received, session extended\n");
+      }
+    });
+
+
     // Simple tree manual resync
     socket.on("fs:treeSimple:resync", () => {
       const sess = getSession(socket.id);
@@ -450,6 +481,48 @@ export function setupSocketHandlers(io) {
       }
     });
   }, 60 * 1000);
+}
+
+
+let _idleMonitorStarted = false;
+export function startIdleMonitor(io) {
+  if (_idleMonitorStarted) return;
+  _idleMonitorStarted = true;
+  setInterval(() => {
+    const now = Date.now();
+    forEachSession((socketId, sess) => {
+      const socket = io.sockets.sockets.get(socketId);
+      if (!socket) return;
+
+      const idleFor = now - (sess.lastActivity || sess.createdAt || now);
+      // Already exceeded max?
+      if (idleFor >= SESSION_IDLE_MAX_MS) {
+        socket.emit("terminal:data", `\n[session] idle ${Math.round(idleFor/1000)}s >= ${Math.round(SESSION_IDLE_MAX_MS/1000)}s – terminating\n`);
+        try { sess.terminate(); } catch {}
+        return;
+      }
+      // Should we send ping?
+      if (idleFor >= _safePingMs) {
+        // Has ping already been sent and timed out?
+        if (sess.pingSentAt) {
+          const sincePing = now - sess.pingSentAt;
+            if (sincePing >= SESSION_IDLE_PING_TIMEOUT_MS) {
+              socket.emit("terminal:data", `[session] no pong within ${(SESSION_IDLE_PING_TIMEOUT_MS/1000)}s – terminating\n`);
+              try { sess.terminate(); } catch {}
+            }
+          return;
+        }
+        // Send new ping
+        setSessionPingSent(sess);
+        socket.emit("session:ping", {
+          idleSeconds: Math.round(idleFor / 1000),
+          willTerminateAfterSeconds: Math.round((SESSION_IDLE_MAX_MS - idleFor) / 1000)
+        });
+        socket.emit("terminal:data",
+          `[session] ping at ${Math.round(idleFor/1000)}s idle; terminate in ${Math.round((SESSION_IDLE_MAX_MS - idleFor)/1000)}s if no activity\n`);
+      }
+    });
+  }, 5000); // check every 5s (tune as needed)
 }
 
 function randomToken() {

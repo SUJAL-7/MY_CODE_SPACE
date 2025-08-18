@@ -14,7 +14,7 @@ import {
   getAllowedNetworkModes,
   getDefaultNetworkMode,
 } from "./containerManager.js";
-import { setupSocketHandlers, SESSION_GRACE_PERIOD_MS } from "./socketHandlers.js";
+import { setupSocketHandlers, SESSION_GRACE_PERIOD_MS ,startIdleMonitor } from "./socketHandlers.js";
 import { getSessionStats } from "./sessionManager.js";
 
 const PORT = process.env.PORT || 8080;
@@ -90,6 +90,7 @@ const io = new Server(httpServer, {
 
 /* Socket logic */
 setupSocketHandlers(io);
+startIdleMonitor(io);
 
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", e));
 process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", r));

@@ -35,7 +35,9 @@ async function setSessionCookies(sessionId, username) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId, username }),
     });
-  } catch {}
+  } catch (error) {
+    console.error("Error setting session cookies:", error);
+  }
 }
 function shortHash(str) {
   if (!str) return "∅";
@@ -54,6 +56,9 @@ export default function App() {
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFile, setActiveFile] = useState("");
   const [terminalOutput, setTerminalOutput] = useState([]);
+
+  const [fileMeta, setFileMeta] = useState({}); 
+  // fileMeta[path] = { dirty, saving, error }
 
   const [showDebugPanel, setShowDebugPanel] = useState(true);
   const [terminalDataCount, setTerminalDataCount] = useState(0);
@@ -250,6 +255,7 @@ export default function App() {
     setActiveFile("");
     setSimpleTree(null);
     setTerminalOutput([]);
+    setFileMeta({});
     if (socketRef.current) {
       disconnectSocket();
       socketRef.current = null;
@@ -290,7 +296,7 @@ export default function App() {
           bottom: 8,
           right: 8,
           background: "#111",
-          color: "#eee",
+            color: "#eee",
           padding: "8px 10px",
           border: "1px solid #444",
           borderRadius: 6,
@@ -415,6 +421,7 @@ export default function App() {
               activeFile={activeFile}
               setActiveFile={setActiveFile}
               setOpenFiles={setOpenFiles}
+              fileMeta={fileMeta}
             />
             <EditorPane
               activeFile={activeFile}
@@ -422,6 +429,8 @@ export default function App() {
               setOpenFiles={setOpenFiles}
               socketRef={socketRef}
               sessionInfo={sessionInfo}
+              fileMeta={fileMeta}
+              setFileMeta={setFileMeta}
             />
           </div>
         </div>

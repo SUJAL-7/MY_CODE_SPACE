@@ -1,5 +1,6 @@
 import { useRef, useEffect } from "react";
 import { Terminal as XTerm } from "xterm";
+import PropTypes from "prop-types";
 import "xterm/css/xterm.css";
 
 export default function Terminal({
@@ -27,7 +28,7 @@ export default function Terminal({
     if (xtermRef.current && sessionIdRef.current === sessionInfo.sessionId) return;
 
     if (xtermRef.current && sessionIdRef.current !== sessionInfo.sessionId) {
-      try { xtermRef.current.dispose(); } catch {}
+      try { xtermRef.current.dispose(); } catch (error) { console.error("Error disposing terminal:", error); }
       xtermRef.current = null;
       lastIdxRef.current = 0;
     }
@@ -61,7 +62,7 @@ export default function Terminal({
 
     return () => {
       if (xtermRef.current === term) {
-        try { term.dispose(); } catch {}
+        try { term.dispose(); } catch (error) { console.error("Error disposing terminal:", error); }
         xtermRef.current = null;
       }
     };
@@ -105,9 +106,22 @@ export default function Terminal({
       </div>
       <div
         ref={containerRef}
-        style={{ flex: 1, overflow: "hidden" }}
+        style={{ flex: 1, overflow: "scroll" }}
         onClick={() => xtermRef.current && xtermRef.current.focus()}
       />
     </div>
   );
 }
+
+Terminal.propTypes = {
+  terminalOutput: PropTypes.arrayOf(PropTypes.string).isRequired,
+  sessionInfo: PropTypes.shape({
+    sessionId: PropTypes.string,
+    token: PropTypes.string,
+    user: PropTypes.string,
+    username: PropTypes.string,
+  }),
+  socketRef: PropTypes.object.isRequired,
+  connected: PropTypes.bool.isRequired,
+  onUserCommand: PropTypes.func,
+};
