@@ -1,25 +1,21 @@
-// Minimal robust snapshot file tree.
-// Contract: fs:treeSimple { version, tree, changed, reason }
-// Directory => {}
-// File => null
+// Simple file tree with debounced nudges to show empty directories quickly.
 //
-// Features:
-// - Warmup multi-scan (captures early files)
-// - Two-phase scan (dirs then files) so empty dirs are never mis-labeled
-// - Null-delimited output; sanitizes control chars
-// - Emits first non-empty snapshot even if hash same
-//
-// Environment (optional):
-//   SIMPLE_TREE_SCAN_MS (default 2000)
-//   SIMPLE_TREE_WARMUP_SCANS (default 3)
-//   SIMPLE_TREE_WARMUP_INTERVAL_MS (default 250)
-//   DEBUG_SANDBOX=1 for logging
+// Additions:
+// - Debounce logic inside nudgeSimpleTree (NudgeDelay).
+// - Optional immediate micro-delay after a nudge is scheduled.
+// - Safe guard against overlapping rebuilds.
+// - Emits after FS mutations almost immediately, making empty folders appear reliably.
 
 const WORKSPACE_ROOT = "/workspace";
 const SCAN_MS = intEnv("SIMPLE_TREE_SCAN_MS", 2000);
 const WARMUP_SCANS = intEnv("SIMPLE_TREE_WARMUP_SCANS", 3);
 const WARMUP_INTERVAL = intEnv("SIMPLE_TREE_WARMUP_INTERVAL_MS", 250);
+const DEDUP_CHARS = process.env.SIMPLE_TREE_DEDUP_LEADING_CHARS || "";
 const DEBUG = process.env.DEBUG_SANDBOX === "1";
+
+// Debounce settings for nudges
+const NUDGE_MIN_DELAY_MS = intEnv("SIMPLE_TREE_NUDGE_DELAY_MS", 120);
+const NUDGE_MAX_WAIT_MS = intEnv("SIMPLE_TREE_NUDGE_MAX_WAIT_MS", 600);
 
 export async function initSimpleTree(session, socket) {
   if (session.simpleTree) {
@@ -32,7 +28,10 @@ export async function initSimpleTree(session, socket) {
     lastHash: "",
     emittedNonEmpty: false,
     disposed: false,
-    loopTimer: null
+    loopTimer: null,
+    nudgeTimer: null,
+    firstNudgeAt: 0,
+    rebuildInFlight: false,
   };
   await warmup(session, socket);
   if (!session.simpleTree?.disposed) startLoop(session, socket);
@@ -41,6 +40,7 @@ export async function initSimpleTree(session, socket) {
 export function destroySimpleTree(session) {
   if (!session.simpleTree) return;
   if (session.simpleTree.loopTimer) clearTimeout(session.simpleTree.loopTimer);
+  if (session.simpleTree.nudgeTimer) clearTimeout(session.simpleTree.nudgeTimer);
   session.simpleTree.disposed = true;
   session.simpleTree = null;
 }
@@ -53,7 +53,38 @@ export async function resyncSimpleTree(session, socket) {
   await rebuild(session, socket, "manual-resync", { forceEmit: true });
 }
 
-// ---- Warmup ----
+export async function nudgeSimpleTree(session, socket, reason = "nudge") {
+  const st = session.simpleTree;
+  if (!st || st.disposed) return;
+
+  // If a rebuild currently running, schedule a future pass.
+  if (st.rebuildInFlight) {
+    if (DEBUG) console.log("[simpleFS] nudge ignored (in-flight rebuild)");
+    scheduleDebouncedNudge(session, socket, reason);
+    return;
+  }
+
+  scheduleDebouncedNudge(session, socket, reason);
+}
+
+function scheduleDebouncedNudge(session, socket, reason) {
+  const st = session.simpleTree;
+  if (!st || st.disposed) return;
+
+  const nowTs = Date.now();
+  if (!st.firstNudgeAt) st.firstNudgeAt = nowTs;
+
+  const elapsed = nowTs - st.firstNudgeAt;
+  const delay = elapsed >= NUDGE_MAX_WAIT_MS ? 0 : NUDGE_MIN_DELAY_MS;
+
+  if (st.nudgeTimer) clearTimeout(st.nudgeTimer);
+  st.nudgeTimer = setTimeout(() => {
+    st.nudgeTimer = null;
+    st.firstNudgeAt = 0;
+    rebuild(session, socket, `debounced-${reason}`, { forceEmit: true }).catch(() => {});
+  }, delay);
+}
+
 async function warmup(session, socket) {
   if (!session.simpleTree) return;
   for (let i = 0; i < WARMUP_SCANS; i++) {
@@ -68,37 +99,43 @@ async function warmup(session, socket) {
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ---- Rebuild ----
 async function rebuild(session, socket, reason, opts = {}) {
-  if (!session.simpleTree || session.simpleTree.disposed) return;
-  const { forceEmit = false } = opts;
+  const st = session.simpleTree;
+  if (!st || st.disposed) return;
+  if (st.rebuildInFlight) return; // soft skip; nudge mechanism will handle extras
+  st.rebuildInFlight = true;
 
+  const { forceEmit = false } = opts;
   let tree;
   try {
     tree = await buildTree(session.container);
   } catch (e) {
     console.warn("[simpleFS] scan error:", e.message);
+    st.rebuildInFlight = false;
     return;
   }
 
   const isEmpty = Object.keys(tree).length === 0;
   const hash = hashTree(tree);
-  const changed = hash !== session.simpleTree.lastHash;
-  const shouldEmit =
-    forceEmit ||
-    changed ||
-    (!session.simpleTree.emittedNonEmpty && !isEmpty);
+  const changed = hash !== st.lastHash;
+  const shouldEmit = forceEmit || changed || (!st.emittedNonEmpty && !isEmpty);
 
   if (shouldEmit) {
-    session.simpleTree.tree = tree;
-    session.simpleTree.version += 1;
-    session.simpleTree.lastHash = hash;
-    if (!isEmpty) session.simpleTree.emittedNonEmpty = true;
+    st.tree = tree;
+    st.version += 1;
+    st.lastHash = hash;
+    if (!isEmpty) st.emittedNonEmpty = true;
     emitSnapshot(session, socket, changed, reason);
-    DEBUG && console.log(`[simpleFS] emit v${session.simpleTree.version} reason=${reason} changed=${changed} empty=${isEmpty} entries=${Object.keys(tree).length}`);
+    DEBUG && console.log(
+      `[simpleFS] emit v${st.version} reason=${reason} changed=${changed} empty=${isEmpty} entries=${Object.keys(tree).length}`
+    );
   } else {
-    DEBUG && console.log(`[simpleFS] skip reason=${reason} changed=${changed} empty=${isEmpty}`);
+    DEBUG && console.log(
+      `[simpleFS] skip reason=${reason} changed=${changed} empty=${isEmpty}`
+    );
   }
+
+  st.rebuildInFlight = false;
 }
 
 function emitSnapshot(session, socket, changed, reason) {
@@ -111,7 +148,6 @@ function emitSnapshot(session, socket, changed, reason) {
   });
 }
 
-// ---- Periodic loop ----
 function startLoop(session, socket) {
   const loop = async () => {
     if (!session.simpleTree || session.simpleTree.disposed) return;
@@ -123,37 +159,41 @@ function startLoop(session, socket) {
   session.simpleTree.loopTimer = setTimeout(loop, SCAN_MS);
 }
 
-// ---- Build Tree (two-phase, sanitized) ----
 async function buildTree(container) {
+  // Unified find for files & dirs (including hidden)
   const cmd = `
 set -e
-# Directories first (null-delimited)
-find ${WORKSPACE_ROOT} -type d -mindepth 1 -printf '%P\\0'
-printf '\\n'
-# Files
-find ${WORKSPACE_ROOT} -type f -mindepth 1 -printf '%P\\0'
-`;
+find ${WORKSPACE_ROOT} -mindepth 1 -printf '%y|%P\\0'
+`.trim();
+
   const out = await exec(container, cmd);
 
-  const splitAt = out.indexOf("\n");
-  let dirSegment = out;
-  let fileSegment = "";
-  if (splitAt !== -1) {
-    dirSegment = out.slice(0, splitAt);
-    fileSegment = out.slice(splitAt + 1);
-  }
-
   const sanitize = s =>
-    s.replace(/[\x00-\x1F\x7F]/g, "").replace(/\/{2,}/g, "/").trim();
+    s.replace(/[\x00-\x1F\x7F]/g, "")
+      .replace(/\\/g, "/")
+      .replace(/\/{2,}/g, "/")
+      .trim();
 
-  const dirs = dirSegment.split("\0").filter(Boolean).map(sanitize).filter(Boolean);
-  const files = fileSegment.split("\0").filter(Boolean).map(sanitize).filter(Boolean);
+  const records = out.split("\0").filter(Boolean).map(r => sanitize(r));
+  const dirs = [];
+  const files = [];
+
+  for (const rec of records) {
+    const idx = rec.indexOf("|");
+    if (idx === -1) continue;
+    const typeChar = rec.slice(0, idx);
+    let rel = rec.slice(idx + 1);
+    if (!rel || rel === ".") continue;
+    if (rel.startsWith("/")) rel = rel.slice(1);
+    if (!rel) continue;
+    if (typeChar === "d") dirs.push(rel);
+    else if (typeChar === "f") files.push(rel);
+  }
 
   dirs.sort();
   files.sort();
 
   const tree = {};
-
   function ensureDir(parts) {
     let cur = tree;
     for (const part of parts) {
@@ -164,13 +204,11 @@ find ${WORKSPACE_ROOT} -type f -mindepth 1 -printf '%P\\0'
     return cur;
   }
 
-  // Phase 1: dirs
   for (const d of dirs) {
     const parts = d.split("/").filter(Boolean);
     if (parts.length) ensureDir(parts);
   }
 
-  // Phase 2: files
   for (const f of files) {
     const parts = f.split("/").filter(Boolean);
     if (!parts.length) continue;
@@ -178,13 +216,44 @@ find ${WORKSPACE_ROOT} -type f -mindepth 1 -printf '%P\\0'
     const leaf = parts[parts.length - 1];
     const parent = ensureDir(dirParts);
     if (!(leaf in parent)) parent[leaf] = null;
-    // if already a dir with same name, keep dir
+    else if (parent[leaf] && typeof parent[leaf] === "object" && Object.keys(parent[leaf]).length === 0) {
+      parent[leaf] = null;
+    }
+  }
+
+  if (DEDUP_CHARS) {
+    dedupLeadingCharSiblings(tree, DEDUP_CHARS);
   }
 
   return tree;
 }
 
-// ---- Hash (stable FNV-1a) ----
+function dedupLeadingCharSiblings(node, chars) {
+  if (!node || typeof node !== "object") return;
+  const names = Object.keys(node);
+  for (const name of names) {
+    const val = node[name];
+    if (val && typeof val === "object") dedupLeadingCharSiblings(val, chars);
+  }
+  for (const ch of chars) {
+    for (const name of names) {
+      if (!name.startsWith(ch)) continue;
+      const base = name.slice(1);
+      if (!base) continue;
+      if (Object.prototype.hasOwnProperty.call(node, base) &&
+          Object.prototype.hasOwnProperty.call(node, name)) {
+        const prefixed = node[name];
+        const baseNode = node[base];
+        const prefEmpty = prefixed && typeof prefixed === "object" && Object.keys(prefixed).length === 0;
+        const baseEmpty = baseNode && typeof baseNode === "object" && Object.keys(baseNode).length === 0;
+        if (prefEmpty && !baseEmpty) {
+          delete node[name];
+        }
+      }
+    }
+  }
+}
+
 function hashTree(tree) {
   let h = 2166136261 >>> 0;
   (function walk(node, base) {
@@ -203,7 +272,6 @@ function hashTree(tree) {
   return h.toString(36);
 }
 
-// ---- Exec helper ----
 function exec(container, cmd) {
   return new Promise((resolve, reject) => {
     container.exec(

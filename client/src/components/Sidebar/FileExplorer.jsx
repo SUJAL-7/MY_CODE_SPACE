@@ -1,5 +1,5 @@
 import PropTypes from "prop-types";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 
 // tree: { nameOrDir: null | { ... } }
 export default function FileExplorer({ tree, onOpenFile, onResync }) {
@@ -12,6 +12,31 @@ export default function FileExplorer({ tree, onOpenFile, onResync }) {
       return next;
     });
   }, []);
+
+  // Prune expansion entries that no longer exist after a new snapshot
+  useEffect(() => {
+    if (!tree) return;
+    const valid = new Set();
+    function walk(node, base) {
+      valid.add(base);
+      for (const k of Object.keys(node)) {
+        const val = node[k];
+        const rel = base ? `${base}/${k}` : k;
+        if (val && typeof val === "object") walk(val, rel);
+        else valid.add(rel);
+      }
+    }
+    walk(tree, "");
+    setExpanded(prev => {
+      let changed = false;
+      const out = new Set();
+      for (const p of prev) {
+        if (valid.has(p)) out.add(p);
+        else changed = true;
+      }
+      return changed ? out : prev;
+    });
+  }, [tree]);
 
   function renderDir(obj, basePath) {
     const entries = Object.keys(obj).sort((a, b) => {
@@ -26,7 +51,7 @@ export default function FileExplorer({ tree, onOpenFile, onResync }) {
         {entries.map(name => {
           const val = obj[name];
           const rel = basePath ? `${basePath}/${name}` : name;
-            const isDir = val && typeof val === "object";
+          const isDir = val && typeof val === "object";
           const open = expanded.has(rel);
           return (
             <li key={rel}>
