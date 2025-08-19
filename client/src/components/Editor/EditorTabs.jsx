@@ -1,5 +1,5 @@
-// import React from "react";
 import PropTypes from "prop-types";
+import { FiX, FiAlertCircle, FiSave, FiEdit3, FiCircle } from "react-icons/fi";
 
 export default function EditorTabs({
   openFiles,
@@ -10,7 +10,7 @@ export default function EditorTabs({
 }) {
   if (!openFiles.length) {
     return (
-      <div className="flex items-center h-8 px-3 bg-gray-800 text-xs text-gray-400 select-none">
+      <div className="flex items-center h-9 px-4 bg-[#2d2d30] text-sm text-[#858585] select-none border-b border-[#3e3e42]">
         No files open
       </div>
     );
@@ -29,45 +29,62 @@ export default function EditorTabs({
   };
 
   return (
-    <div className="flex h-8 bg-gray-800 overflow-x-auto scrollbar-thin">
+    <div className="flex h-9 bg-[#2d2d30] border-b border-[#3e3e42] overflow-x-auto scrollbar-thin scrollbar-thumb-[#424242] scrollbar-track-[#2d2d30]">
       {openFiles.map((path) => {
         const meta = fileMeta[path] || {};
         const base = path.split("/").pop();
-        let indicator = "";
-        if (meta.saving) indicator = "●";
-        else if (meta.error) indicator = "✕";
-        else if (meta.dirty) indicator = "●";
+
+        // Status indicator with icon and color
+        let indicator = null;
+        if (meta.saving)
+          indicator = <FiSave className="text-[#ffcc66] animate-pulse" title="Saving" />;
+        else if (meta.error)
+          indicator = <FiAlertCircle className="text-[#f48771]" title="Error" />;
+        else if (meta.dirty)
+          indicator = <FiCircle className="text-[#ffcc66]" title="Unsaved changes" />;
+
         return (
           <div
             key={path}
             onClick={() => setActiveFile(path)}
-            className={`flex items-center px-3 text-xs cursor-pointer select-none border-r border-gray-700 ${
-              path === activeFile ? "bg-gray-900 text-blue-300" : "text-gray-300 hover:bg-gray-700"
-            }`}
-            style={{ maxWidth: 200 }}
+            className={`flex items-center px-3 text-sm cursor-pointer select-none border-r border-[#3e3e42] transition-colors group
+              ${path === activeFile 
+                ? "bg-[#1e1e1e] text-[#cccccc] border-t border-[#4ec9b0]" 
+                : "text-[#858585] hover:bg-[#37373d] hover:text-[#cccccc]"
+              }`}
+            style={{ maxWidth: 240, minWidth: 80 }}
             title={path}
+            tabIndex={0}
+            onKeyDown={e => { 
+              if (e.key === "Enter" || e.key === " ") setActiveFile(path); 
+            }}
           >
-            <span className="truncate">{base}</span>
+            {/* File icon */}
+            <span className="mr-2 flex-shrink-0">
+              <FiEdit3 className={`w-3.5 h-3.5 ${
+                path === activeFile ? "text-[#4ec9b0]" : "text-[#858585] group-hover:text-[#cccccc]"
+              }`} />
+            </span>
+            
+            {/* File name */}
+            <span className="truncate text-[13px] font-medium">{base}</span>
+            
+            {/* Status indicator */}
             {indicator && (
-              <span
-                className={`ml-1 ${
-                  meta.error
-                    ? "text-red-500"
-                    : meta.saving
-                    ? "text-amber-400 animate-pulse"
-                    : "text-green-400"
-                }`}
-              >
-                {indicator}
-              </span>
+              <span className="ml-2 flex items-center flex-shrink-0">{indicator}</span>
             )}
+            
+            {/* Close button */}
             <button
               onClick={(e) => closeFile(path, e)}
-              className="ml-2 text-gray-500 hover:text-gray-300"
-              style={{ fontSize: 11 }}
+              className="ml-2 p-0.5 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity flex-shrink-0"
+              style={{ fontSize: 13 }}
               title="Close"
+              tabIndex={-1}
             >
-              ×
+              <FiX className={`w-3.5 h-3.5 ${
+                path === activeFile ? "text-[#858585] hover:text-[#cccccc]" : "text-[#5a5a5a] hover:text-[#858585]"
+              }`} />
             </button>
           </div>
         );

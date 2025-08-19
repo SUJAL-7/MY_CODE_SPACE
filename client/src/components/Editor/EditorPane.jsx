@@ -6,6 +6,7 @@ import {
 } from "react";
 import Editor from "@monaco-editor/react";
 import PropTypes from 'prop-types';
+import { FiSave, FiX, FiAlertCircle, FiCheckCircle, FiEdit3 } from "react-icons/fi";
 
 const AUTO_SAVE_DELAY = 1500; // ms
 
@@ -19,16 +20,13 @@ export default function EditorPane({
   setFileMeta
 }) {
   const buffersRef = useRef(new Map());
-  // buffer: { path, content, lastSavedContent, modelLanguage }
-
-  const saveTimersRef = useRef(new Map()); // path -> timer id
-  const pendingReadsRef = useRef(new Map()); // requestId -> path
+  const saveTimersRef = useRef(new Map());
+  const pendingReadsRef = useRef(new Map());
 
   const socket = socketRef.current;
   const sessionId = sessionInfo?.sessionId;
   const token = sessionInfo?.token;
 
-  // Track current editor file state (for value binding)
   const [editorValue, setEditorValue] = useState("");
   const [editorLanguage, setEditorLanguage] = useState("plaintext");
   const lastActiveFileRef = useRef("");
@@ -50,7 +48,6 @@ export default function EditorPane({
       if (existing && existing.content != null) {
         return;
       }
-      // Issue read
       const requestId = `read-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       pendingReadsRef.current.set(requestId, path);
       socket.emit("fs:read", {
@@ -97,6 +94,19 @@ export default function EditorPane({
       case "cc":
       case "hpp":
         return "cpp";
+      case "go":
+        return "go";
+      case "rs":
+        return "rust";
+      case "php":
+        return "php";
+      case "rb":
+        return "ruby";
+      case "xml":
+        return "xml";
+      case "yaml":
+      case "yml":
+        return "yaml";
       default:
         return "plaintext";
     }
@@ -133,18 +143,15 @@ export default function EditorPane({
   }, [socket, sessionId, token, updateFileMeta]);
 
   const closeFile = useCallback((path) => {
-    // Remove from openFiles
     setOpenFiles((prev) => prev.filter((p) => p !== path));
-    // cancel timers
     const t = saveTimersRef.current.get(path);
     if (t) {
       clearTimeout(t);
       saveTimersRef.current.delete(path);
     }
-    // Keep bufferRef for possible reopen (or prune if you want)
   }, [setOpenFiles]);
 
-  /* ---------------- Socket Listeners (read/write) ---------------- */
+  /* ---------------- Socket Listeners ---------------- */
 
   useEffect(() => {
     if (!socket) return;
@@ -172,7 +179,6 @@ export default function EditorPane({
         error: undefined
       });
 
-      // If this is still active file, update editor view
       if (activeFile === path) {
         setEditorValue(content);
         setEditorLanguage(lang);
@@ -190,7 +196,6 @@ export default function EditorPane({
           });
         }
       } else if (err.op === "write") {
-        // We rely on path field in error if available
         const path = err.path;
         if (path) {
           updateFileMeta(path, {
@@ -205,7 +210,6 @@ export default function EditorPane({
       const { path } = msg;
       const buf = buffersRef.current.get(path);
       if (!buf) return;
-      // mark saved
       buf.lastSavedContent = buf.content;
       updateFileMeta(path, { saving: false, dirty: false, error: undefined });
     };
@@ -234,7 +238,6 @@ export default function EditorPane({
       setEditorValue(buf.content);
       setEditorLanguage(buf.modelLanguage || guessLanguage(activeFile));
     } else {
-      // show loading placeholder
       setEditorValue("// Loading...");
       setEditorLanguage(guessLanguage(activeFile));
     }
@@ -257,6 +260,7 @@ export default function EditorPane({
     const dirty = buf.content !== buf.lastSavedContent;
     updateFileMeta(path, { dirty });
     scheduleAutoSave(path);
+    setEditorValue(val);
   }, [activeFile, scheduleAutoSave, updateFileMeta]);
 
   /* ---------------- Manual Save (Ctrl/Cmd+S) ---------------- */
@@ -287,8 +291,8 @@ export default function EditorPane({
 
   if (!openFiles.length) {
     return (
-      <div className="flex flex-1 items-center justify-center text-sm text-gray-500 bg-gray-900">
-        Open a file from the sidebar.
+      <div className="flex flex-1 items-center justify-center text-sm text-[#858585] bg-[#1e1e1e]">
+        Open a file from the sidebar to start editing.
       </div>
     );
   }
@@ -296,54 +300,129 @@ export default function EditorPane({
   const meta = activeFile ? fileMeta[activeFile] : null;
 
   return (
-    <div className="flex flex-1 min-h-0 min-w-0 relative">
+    <div className="flex flex-1 min-h-96 min-w-0 relative bg-[#1e1e1e] overflow-y-scroll">
       {!activeFile && (
-        <div className="m-auto text-gray-500 text-sm">No file selected</div>
+        <div className="m-auto text-[#858585] text-sm">Select a file to edit</div>
       )}
       {activeFile && (
-        <div className="flex flex-col flex-1 min-h-0 min-w-0">
-          <div className="h-6 flex items-center px-3 text-xs bg-gray-800 border-b border-gray-700 select-none">
-            <span className="truncate max-w-[60%]">{activeFile}</span>
-            <span className="ml-3">
-              {meta?.saving
-                ? "Saving..."
-                : meta?.error
-                ? `Error: ${meta.error}`
-                : meta?.dirty
-                ? "Unsaved"
-                : "Saved"}
+        <div className="flex flex-col flex-1 min-h-96 min-w-0 overflow-y-auto">
+          {/* Editor Header */}
+          <div className="h-8 flex items-center px-4 text-xs bg-[#2d2d30] border-b border-[#3e3e42] select-none gap-3">
+            <span className="truncate max-w-[50%] text-[#cccccc] flex items-center gap-2">
+              <FiEdit3 className="text-[#4ec9b0] w-3.5 h-3.5 flex-shrink-0" /> 
+              <span className="truncate font-medium text-[13px]">{activeFile}</span>
             </span>
+            
+            <span className="flex items-center gap-1.5 text-[11px] font-medium">
+              {meta?.saving ? (
+                <>
+                  <FiSave className="text-[#ffcc66] animate-pulse w-3.5 h-3.5" />
+                  <span className="text-[#ffcc66]">Saving...</span>
+                </>
+              ) : meta?.error ? (
+                <>
+                  <FiAlertCircle className="text-[#f48771] w-3.5 h-3.5" />
+                  <span className="text-[#f48771]">{meta.error}</span>
+                </>
+              ) : meta?.dirty ? (
+                <>
+                  <FiSave className="text-[#ffcc66] w-3.5 h-3.5" />
+                  <span className="text-[#ffcc66]">Unsaved</span>
+                </>
+              ) : (
+                <>
+                  <FiCheckCircle className="text-[#4ec9b0] w-3.5 h-3.5" />
+                  <span className="text-[#4ec9b0]">Saved</span>
+                </>
+              )}
+            </span>
+            
+            <div className="flex-1" />
+            
             <button
               onClick={() => performSave(activeFile)}
-              className="ml-auto px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-500 rounded"
+              className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded transition-colors border ${
+                meta?.saving || !meta?.dirty
+                  ? "bg-[#3a3d41] text-[#858585] border-[#4f5256] cursor-not-allowed"
+                  : "bg-[#0e639c] hover:bg-[#1177bb] text-white border-[#0a4d78]"
+              }`}
               disabled={meta?.saving || !meta?.dirty}
+              title="Save (Ctrl+S)"
             >
-              Save
+              <FiSave className="w-3 h-3" /> Save
             </button>
+            
             <button
               onClick={() => closeFile(activeFile)}
-              className="ml-2 px-2 py-0.5 text-xs bg-gray-700 hover:bg-gray-600 rounded"
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded bg-[#3a3d41] hover:bg-[#45494e] text-[#cccccc] border border-[#4f5256] transition-colors"
+              title="Close file"
             >
-              Close
+              <FiX className="w-3 h-3" /> Close
             </button>
           </div>
-          <div className="flex-1 min-h-0 min-w-0">
+          
+          {/* Monaco Editor */}
+          <div className="flex-1 min-h-96 min-w-0 overflow-y-scroll">
             <Editor
-              key={activeFile} // ensures model path change
+              key={activeFile}
               path={activeFile}
               theme="vs-dark"
               language={editorLanguage}
               value={editorValue}
               onChange={handleChange}
               options={{
-                fontSize: 14,
+                fontFamily: "'Fira Code', 'Fira Mono', Consolas, 'Courier New', monospace",
                 minimap: { enabled: false },
                 automaticLayout: true,
                 scrollBeyondLastLine: false,
-                tabSize: 2,
                 wordWrap: "on",
+                lineNumbers: "on",
+                glyphMargin: true,
+                folding: true,
+                lineDecorationsWidth: 12,
+                renderLineHighlight: 'all',
+                matchBrackets: 'always',
+                autoClosingBrackets: 'always',
+                autoIndent: 'full',
+                suggestOnTriggerCharacters: true,
+                wordBasedSuggestions: true,
+                parameterHints: { enabled: true },
+                cursorBlinking: 'blink',
+                cursorSmoothCaretAnimation: 'on',
+                cursorStyle: 'line',
+                cursorWidth: 2,
+                smoothScrolling: true,
+                mouseWheelZoom: true,
+                accessibilitySupport: 'on'
               }}
-              loading={<div className="p-4 text-xs text-gray-500">Loading editor...</div>}
+              loading={
+                <div className="flex items-center justify-center h-full bg-[#1e1e1e]">
+                  <div className="text-[#858585] text-sm flex items-center gap-2">
+                    <div className="w-3 h-3 border-2 border-[#4ec9b0] border-t-transparent rounded-full animate-spin"></div>
+                    Loading editor...
+                  </div>
+                </div>
+              }
+              onMount={(editor, monaco) => {
+                // Configure editor theme for better visibility
+                monaco.editor.defineTheme('custom-dark', {
+                  base: 'vs-dark',
+                  inherit: true,
+                  rules: [
+                    { token: '', foreground: 'cccccc', background: '1e1e1e' },
+                    { token: 'comment', foreground: '6A9955' },
+                  ],
+                  colors: {
+                    'editor.background': '#1e1e1e',
+                    'editor.foreground': '#cccccc',
+                    'editor.lineHighlightBackground': '#2d2d30',
+                    'editorCursor.foreground': '#4ec9b0',
+                    'editor.selectionBackground': '#264f78',
+                    'editor.inactiveSelectionBackground': '#3a3d41',
+                  }
+                });
+                monaco.editor.setTheme('custom-dark');
+              }}
             />
           </div>
         </div>
@@ -352,17 +431,12 @@ export default function EditorPane({
   );
 }
 
-
 EditorPane.propTypes = {
   openFiles: PropTypes.arrayOf(PropTypes.string).isRequired,
   activeFile: PropTypes.string.isRequired,
   setOpenFiles: PropTypes.func.isRequired,
   socketRef: PropTypes.shape({
-    current: PropTypes.shape({
-      on: PropTypes.func.isRequired,
-      off: PropTypes.func.isRequired,
-      emit: PropTypes.func.isRequired,
-    }).isRequired,
+    current: PropTypes.object,
   }).isRequired,
   sessionInfo: PropTypes.shape({
     sessionId: PropTypes.string,

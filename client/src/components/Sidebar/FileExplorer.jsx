@@ -1,14 +1,14 @@
 import PropTypes from "prop-types";
 import { useState, useCallback, useEffect } from "react";
+import { FiFile, FiRefreshCw, FiChevronRight, FiChevronDown } from "react-icons/fi";
 
-// tree: { nameOrDir: null | { ... } }
 export default function FileExplorer({ tree, onOpenFile, onResync }) {
   const [expanded, setExpanded] = useState(new Set([""]));
 
-  const toggle = useCallback((p) => {
-    setExpanded(prev => {
+  const toggle = useCallback((path) => {
+    setExpanded((prev) => {
       const next = new Set(prev);
-      next.has(p) ? next.delete(p) : next.add(p);
+      next.has(path) ? next.delete(path) : next.add(path);
       return next;
     });
   }, []);
@@ -17,73 +17,90 @@ export default function FileExplorer({ tree, onOpenFile, onResync }) {
   useEffect(() => {
     if (!tree) return;
     const valid = new Set();
-    function walk(node, base) {
-      valid.add(base);
-      for (const k of Object.keys(node)) {
-        const val = node[k];
-        const rel = base ? `${base}/${k}` : k;
-        if (val && typeof val === "object") walk(val, rel);
-        else valid.add(rel);
+    function walk(node, basePath) {
+      valid.add(basePath);
+      for (const key of Object.keys(node)) {
+        const value = node[key];
+        const relativePath = basePath ? `${basePath}/${key}` : key;
+        if (value && typeof value === "object") walk(value, relativePath);
+        else valid.add(relativePath);
       }
     }
     walk(tree, "");
-    setExpanded(prev => {
+    setExpanded((prev) => {
       let changed = false;
       const out = new Set();
-      for (const p of prev) {
-        if (valid.has(p)) out.add(p);
+      for (const path of prev) {
+        if (valid.has(path)) out.add(path);
         else changed = true;
       }
       return changed ? out : prev;
     });
   }, [tree]);
 
-  function renderDir(obj, basePath) {
+  function renderDirectory(obj, basePath) {
     const entries = Object.keys(obj).sort((a, b) => {
-      const aDir = obj[a] && typeof obj[a] === "object";
-      const bDir = obj[b] && typeof obj[b] === "object";
-      if (aDir !== bDir) return aDir ? -1 : 1;
+      const aIsDir = obj[a] && typeof obj[a] === "object";
+      const bIsDir = obj[b] && typeof obj[b] === "object";
+      if (aIsDir !== bIsDir) return aIsDir ? -1 : 1;
       return a.localeCompare(b);
     });
 
     return (
-      <ul className={basePath ? "pl-4" : ""}>
-        {entries.map(name => {
-          const val = obj[name];
-          const rel = basePath ? `${basePath}/${name}` : name;
-          const isDir = val && typeof val === "object";
-          const open = expanded.has(rel);
+      <ul className={basePath ? "pl-4 ml-1 border-l border-[#404040]" : ""}>
+        {entries.map((name) => {
+          const value = obj[name];
+          const relativePath = basePath ? `${basePath}/${name}` : name;
+          const isDirectory = value && typeof value === "object";
+          const isExpanded = expanded.has(relativePath);
+          
           return (
-            <li key={rel}>
-              {isDir ? (
-                <div className="flex items-center gap-1 py-[1px]">
+            <li key={relativePath} className="group">
+              {isDirectory ? (
+                <div className="flex items-center gap-1 py-1 cursor-pointer hover:bg-[#2a2d2e] rounded pr-1 transition-colors">
                   <button
-                    className="w-4 text-xs text-gray-300 hover:text-white"
-                    onClick={() => toggle(rel)}
+                    className="w-4 text-[#858585] group-hover:text-[#cccccc] transition-colors focus:outline-none flex items-center justify-center"
+                    onClick={() => toggle(relativePath)}
+                    aria-label={isExpanded ? "Collapse folder" : "Expand folder"}
+                    tabIndex={-1}
                   >
-                    {open ? "▼" : "▶"}
+                    {isExpanded ? (
+                      <FiChevronDown className="w-3.5 h-3.5" />
+                    ) : (
+                      <FiChevronRight className="w-3.5 h-3.5" />
+                    )}
                   </button>
                   <span
-                    className="cursor-pointer text-gray-200 hover:text-white"
-                    onClick={() => toggle(rel)}
+                    className="text-[#cccccc] group-hover:text-white truncate flex items-center gap-1.5 text-sm"
+                    onClick={() => toggle(relativePath)}
+                    tabIndex={0}
+                    role="button"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") toggle(relativePath);
+                    }}
                   >
-                    {name}/
+                    <span className="w-4 h-4 flex items-center justify-center text-[#4ec9b0]">
+                      {isExpanded ? "📂" : "📁"}
+                    </span>
+                    {name}
                   </span>
                 </div>
               ) : (
                 <button
-                  onClick={() => onOpenFile(rel)}
-                  className="text-blue-400 hover:underline text-left py-[1px]"
+                  onClick={() => onOpenFile(relativePath)}
+                  className="flex items-center gap-2 w-full text-left py-1 pl-5 text-[#cccccc] hover:bg-[#2a2d2e] rounded hover:text-white transition-colors text-sm"
+                  title={name}
                 >
-                  {name}
+                  <FiFile className="w-3.5 h-3.5 text-[#9cdcfe] flex-shrink-0" />
+                  <span className="truncate">{name}</span>
                 </button>
               )}
-              {isDir && open && renderDir(val, rel)}
+              {isDirectory && isExpanded && renderDirectory(value, relativePath)}
             </li>
           );
         })}
         {entries.length === 0 && basePath && (
-          <li className="text-gray-500 italic">(empty)</li>
+          <li className="text-[#858585] italic pl-6 text-xs">(empty directory)</li>
         )}
       </ul>
     );
@@ -91,31 +108,42 @@ export default function FileExplorer({ tree, onOpenFile, onResync }) {
 
   if (!tree) {
     return (
-      <div className="p-2 text-xs text-gray-400">
-        Loading...
+      <div className="p-4 text-[#858585] text-sm flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 border-2 border-[#4ec9b0] border-t-transparent rounded-full animate-spin"></div>
+          <span>Loading file structure...</span>
+        </div>
         <button
-          className="ml-2 px-2 py-0.5 bg-gray-700 rounded text-xs"
+          className="px-3 py-1.5 bg-[#3a3d41] hover:bg-[#45494e] rounded text-xs text-[#cccccc] flex items-center gap-2 transition-colors border border-[#4f5256]"
           onClick={onResync}
         >
-          Resync
+          <FiRefreshCw className="w-3 h-3" />
+          Resync Files
         </button>
       </div>
     );
   }
 
   return (
-    <div className="overflow-auto flex-1 text-xs p-2 select-none">
-      <div className="flex items-center justify-between mb-1">
-        <span className="font-semibold text-gray-300">Files</span>
+    <div className="overflow-auto flex-1 text-sm select-none p-3">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-3 px-1">
+        <span className="font-semibold text-[#cccccc] text-[13px] uppercase tracking-wide">
+          WORKSPACE
+        </span>
         <button
-          className="px-2 py-0.5 bg-gray-700 rounded text-[10px] hover:bg-gray-600"
+          className="p-1.5 text-[#858585] hover:text-[#cccccc] hover:bg-[#3a3d41] rounded transition-colors border border-transparent hover:border-[#4f5256]"
           onClick={onResync}
-          title="Force full rescan"
+          title="Rescan file system"
         >
-          Resync
+          <FiRefreshCw className="w-3.5 h-3.5" />
         </button>
       </div>
-      {renderDir(tree, "")}
+
+      {/* File Tree */}
+      <div className="space-y-0.5">
+        {renderDirectory(tree, "")}
+      </div>
     </div>
   );
 }
