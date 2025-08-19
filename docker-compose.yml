@@ -5,11 +5,12 @@ services:
     build:
       context: ./server
       dockerfile: Dockerfile
+      target: orchestrator   # ensure we build the orchestrator stage
     environment:
       SANDBOX_MODE: container
-      # Core image
-      FORCED_BASE_IMAGE: ubuntu:22.04
-      ALLOWLIST_IMAGES: ubuntu:22.04
+      # Core image (point to our dev-base image instead of stock Ubuntu)
+      FORCED_BASE_IMAGE: dev-base:latest
+      ALLOWLIST_IMAGES: dev-base:latest
       DIGEST_REQUIRED: "false"
       FORCED_NETWORK_MODE: bridge
 
@@ -65,6 +66,15 @@ services:
       - server
     ports:
       - "3000:3000"
+
+  # Pre-build the dev-base image so user containers can spawn quickly
+  dev-base:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+      target: dev-base
+    image: dev-base:latest
+    profiles: ["dont-start"] # prevents this container from running, only builds the image
 
 volumes:
   server_workspaces:
