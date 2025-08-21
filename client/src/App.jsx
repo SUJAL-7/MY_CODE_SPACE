@@ -18,7 +18,7 @@ import Terminal from "./components/Terminal";
 import StatusBar from "./components/StatusBar";
 
 const SERVER_URL =
-  import.meta.env.VITE_REACT_APP_SERVER_URL || "http://localhost:8080";
+  import.meta.env.VITE_REACT_APP_SERVER_URL || "http://3.108.254.28:8080";
 
 function getCookie(name) {
   const m = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));

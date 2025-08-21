@@ -7,7 +7,7 @@ import { io } from "socket.io-client";
 const SERVER_URL =
   import.meta.env.VITE_REACT_APP_SERVER_URL ||
   import.meta.env.REACT_APP_SERVER_URL ||
-  "http://localhost:8080";
+  "http://3.108.254.28:8080";
 
 let socketSingleton = null;
 
