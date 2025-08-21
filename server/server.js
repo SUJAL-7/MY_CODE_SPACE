@@ -18,7 +18,7 @@ import { setupSocketHandlers, SESSION_GRACE_PERIOD_MS ,startIdleMonitor } from "
 import { getSessionStats } from "./sessionManager.js";
 
 const PORT = process.env.PORT || 8080;
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
+const CLIENT_URL = process.env.CLIENT_URL || "http://3.108.254.28:3000";
 const MAX_IDLE_MINUTES = parseInt(process.env.MAX_IDLE_MINUTES || "120", 10);
 
 await ensureWorkspaceRoot();
