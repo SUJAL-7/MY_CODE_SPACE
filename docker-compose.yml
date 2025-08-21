@@ -2,79 +2,52 @@ version: "3.9"
 
 services:
   server:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-      target: orchestrator   # ensure we build the orchestrator stage
+    image: sujalsa/ide-server-image:latest
     environment:
       SANDBOX_MODE: container
-      # Core image (point to our dev-base image instead of stock Ubuntu)
-      FORCED_BASE_IMAGE: dev-base:latest
-      ALLOWLIST_IMAGES: dev-base:latest
+      FORCED_BASE_IMAGE: sujalsa/dev-base:latest
+      ALLOWLIST_IMAGES: sujalsa/dev-base:latest
       DIGEST_REQUIRED: "false"
       FORCED_NETWORK_MODE: bridge
-
-      # Resources
       READONLY_ROOT: "false"
       SANDBOX_MEMORY: 1g
       SANDBOX_CPUS: "1.0"
       SANDBOX_AUTOREMOVE: "true"
-
-      # Capabilities
       RETAIN_CAP_DROP_ALL: "1"
       ALLOWED_EXTRA_CAPS: ""
-
-      # Host workspace usage (false => pure in-container FS)
       USE_HOST_WORKSPACE: "false"
       WORKSPACES_ROOT: /workspaces
       WORKSPACE_PATH: /workspace
-
-      # Limits
       MAX_CONCURRENT_SESSIONS: 20
       MAX_SESSIONS_PER_USER: 3
       MAX_IDLE_MINUTES: 120
       CLEAN_INTERVAL_SECONDS: 60
-
-      # Input throttle
       INPUT_MAX_TOKENS_PER_SEC: 8000
       INPUT_BURST_BYTES: 16000
-
-      # Resource guard (set to 0 to disable)
       RESOURCE_KILL_MEM_PERCENT: "90"
       RESOURCE_KILL_CPU_PERCENT: "350"
       RESOURCE_KILL_SUSTAIN_MS: "20000"
       RESOURCE_KILL_GRACE_MS: "5000"
       RESOURCE_CHECK_INTERVAL_MS: "2000"
-
-      # CLIENT_URL: http://192.168.66.16:3000
       DEBUG_SANDBOX: "0"
-      SERVER_INSTANCE_SECRET: "REPLACE_WITH_RANDOM_32B_HEX"
+      SERVER_INSTANCE_SECRET: "${SERVER_INSTANCE_SECRET}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Uncomment next line ONLY if you set USE_HOST_WORKSPACE=true
-      # - server_workspaces:/workspaces
     ports:
       - "8080:8080"
 
   client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-    # environment:
-      # - VITE_REACT_APP_SERVER_URL=http://192.168.66.16:8080/
+    image: sujalsa/ide-client-image:latest
+    environment:
+      - VITE_REACT_APP_SERVER_URL=http://localhost:8080/
     depends_on:
       - server
     ports:
-      - "3000:3000"
+      - "3100:3000" # Host:Container
 
-  # Pre-build the dev-base image so user containers can spawn quickly
   dev-base:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-      target: dev-base
-    image: dev-base:latest
-    profiles: ["dont-start"] # prevents this container from running, only builds the image
+    image: sujalsa/dev-base:latest
+    profiles: ["dont-start"] # Only for image build
 
 volumes:
   server_workspaces:

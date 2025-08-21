@@ -1,55 +1,136 @@
-# DevSpace
+# MY_CODE_SPACE
 
-DevSpace is an online compiler that spins up a Docker Ubuntu environment on the server. It is built using ReactJS, NodeJS, and ExpressJS. DevSpace provides a seamless coding experience with the ability to install any libraries related to the programming language you are using. 
+**MY_CODE_SPACE** is a next-generation, browser-based development environment designed for seamless coding, execution, and workspace management—all inside secure, ephemeral Docker containers. With a modern, intuitive interface and powerful backend architecture, you can code in your favorite languages, run commands, and manage files as if you were working locally, but with the safety and repeatability of the cloud.
 
-## Features
+---
 
-- **Language Bar**: Allows users to select any programming language for coding.
-- **Code Editor Screen**: A feature-rich editor where users can write their code.
-- **Terminal Section**: A fully functional terminal where users can execute shell commands and install libraries using commands like `pip`, `npm`, etc.
-- **Run Button**: Executes the code and displays the output in the terminal.
-- **Boilerplate Code**: Provides boilerplate code for different programming languages to help users get started quickly.
+## 🚀 Why Use MY_CODE_SPACE?
 
-## How It Works
+- **All-in-one Cloud Workspace:** Edit, run, and manage code in any major language—no setup required on your local machine.
+- **Instant & Isolated:** Each session launches a fresh Ubuntu-based Docker container for complete isolation and freedom to install any package or tool.
+- **Real Shell, Real Power:** Full-featured terminal lets you install dependencies, run build tools, and debug just like on your own machine.
+- **Modern Developer UX:** Monaco-powered editor, responsive file explorer, dark mode, and streamlined controls for a delightful developer experience.
+- **Resource-Smart:** Automatic container cleanup, CPU/memory guards, and idle timeouts keep you and the server safe.
 
-DevSpace leverages Docker to create an isolated Ubuntu environment. This allows for a highly customizable and flexible development environment where users can install any libraries they need.
+---
 
-![diagram-export-16-06-2024-23_05_06](https://github.com/DeepakS-Github/DevSpace/assets/96366840/053b8c2e-e576-45a4-a6cc-19f2d234fb03)
+## 🧩 Features at a Glance
 
-### WebSocket Integration
+- **File Explorer:**  
+  - Rapid navigation and management of project files/folders  
+  - Create, rename, and delete files/directories on the fly
+- **Code Editor:**  
+  - Monaco editor for VS Code–style editing  
+  - Automatic syntax highlighting and language detection  
+  - Instant boilerplate templates for supported languages  
+  - Multiple language support (JS, Python, C++, Java, more)
+- **Integrated Terminal:**  
+  - Real-time shell access inside your container  
+  - Supports `npm`, `pip`, `apt`, compilers, and custom commands  
+  - Output streaming and error feedback
+- **Security & Isolation:**  
+  - Every session runs in a locked-down, disposable Docker instance  
+  - Resource controls (CPU, RAM, idle timeout)
+- **Customizable:**  
+  - Easily adjust resource limits and environment variables for your needs
 
-The terminal section uses WebSocket to provide real-time command execution. This feature is adapted from another one of my GitHub projects, [CloudShell](https://github.com/DeepakS-Github/CloudShell). For detailed information on how the terminal works, please refer to the README file in the CodeShell repository.
+---
 
-## Screenshots
+## 🏗️ System Architecture
 
-![image](https://github.com/DeepakS-Github/DevSpace/assets/96366840/fbf05b0e-811f-4683-948f-dbd4ba006383)
-![image](https://github.com/DeepakS-Github/DevSpace/assets/96366840/20eca3eb-c294-4d03-a7db-8e0e7aa6faf7)
-![image](https://github.com/DeepakS-Github/DevSpace/assets/96366840/aa81f4a9-1570-48af-ab84-5c5aed9134af)
+- **Frontend:**  
+  - React.js (via Vite)  
+  - Monaco Editor  
+  - Tailwind CSS for rapid UI styling
+- **Backend:**  
+  - Node.js + Express.js  
+  - Dockerode for container orchestration  
+  - Real-time WebSocket server for terminal I/O
+- **Isolation:**  
+  - Each workspace = 1 Docker container  
+  - All filesystem and process operations are sandboxed
 
+---
 
-## Installation
+## ⚡ Quick Start
 
-To set up DevSpace locally, follow these steps:
+**Prerequisites:**  
+- [Docker](https://www.docker.com/get-started) installed and running
 
-1. **Clone the repository**:
-    ```bash
-    git clone https://github.com/DeepakS-Github/DevSpace
-    cd DevSpace
-    ```
+### 1. Clone the repository
 
-2. **Start the Docker environment (may take some time)**:
-    ```bash
-    docker-compose up --build
-    ```
+```bash
+git clone https://github.com/SUJAL-7/MY_CODE_SPACE.git
+cd MY_CODE_SPACE
+```
 
-## Usage
+### 2. Build and launch the workspace
 
-1. Open your browser and navigate to `http://localhost:3000`.
-2. Select your preferred programming language from the language bar.
-3. Write your code in the code editor.
-4. Use the terminal to execute shell commands or install any necessary libraries.
-5. Click the "Run" button to see the output in the terminal.
+```bash
+docker-compose up --build
+```
 
-## Contributing
+> First build may take a few minutes as images are prepared.
 
-Contributions are welcome! Please fork this repository and submit pull requests.
+### 3. Access the IDE
+
+Open your browser at:  
+[http://localhost:3100](http://localhost:3100)
+
+---
+
+## 📝 How to Use
+
+1. **Browse Files:** Use the sidebar explorer to view and manage your workspace files/folders.
+2. **Edit Code:**  
+   - Click a file to open and edit it in the Monaco-powered editor.  
+   - New files get instant boilerplate for their language.
+3. **Work in Terminal:**  
+   - Run shell commands, install libraries, or debug with the built-in terminal.
+4. **Run Your Code:**  
+   - Click the **Run** button to execute the current file; output streams to the terminal.
+5. **Customize Environment:**  
+   - Adjust language, theme, and workspace as needed for your workflow.
+
+---
+
+## ⚙️ Configuration & Customization
+
+- **Resource Limits:**  
+  - Tune CPU/memory/idle limits via `.env` or `docker-compose.yml`.
+- **Boilerplate Management:**  
+  - Edit `client/public/boiler-plate/` to add or update language starter templates.
+- **Workspace Persistence:**  
+  - Optionally enable Docker volumes for persistent file storage.
+
+---
+
+## 🤝 Contributing
+
+Pull requests and suggestions are always welcome!  
+- Fork the repo  
+- Open an issue or feature request  
+- Submit your PR—let's make remote coding better together!
+
+---
+
+## 📄 License
+
+This project is released under the MIT License.
+
+---
+
+## 📸 Screenshots
+
+<!-- Add your own screenshots below
+Example:
+![Code Editor](screenshots/editor.png)
+![Terminal](screenshots/terminal.png)
+![File Explorer](screenshots/explorer.png)
+-->
+
+---
+
+## 👨‍💻 Author
+
+Crafted and maintained by [SUJAL-7](https://github.com/SUJAL-7).
