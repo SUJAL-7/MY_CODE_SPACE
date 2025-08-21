@@ -46,7 +46,7 @@ services:
       RESOURCE_KILL_GRACE_MS: "5000"
       RESOURCE_CHECK_INTERVAL_MS: "2000"
 
-      CLIENT_URL: http://localhost:3000
+      # CLIENT_URL: http://192.168.66.16:3000
       DEBUG_SANDBOX: "0"
       SERVER_INSTANCE_SECRET: "REPLACE_WITH_RANDOM_32B_HEX"
     volumes:
@@ -60,8 +60,8 @@ services:
     build:
       context: ./client
       dockerfile: Dockerfile
-    environment:
-      - VITE_SERVER_URL=http://server:8080
+    # environment:
+      # - VITE_REACT_APP_SERVER_URL=http://192.168.66.16:8080/
     depends_on:
       - server
     ports:

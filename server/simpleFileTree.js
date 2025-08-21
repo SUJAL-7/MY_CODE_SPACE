@@ -28,6 +28,7 @@ export async function initSimpleTree(session, socket) {
     lastHash: "",
     emittedNonEmpty: false,
     disposed: false,
+    failed: false, // <--- NEW
     loopTimer: null,
     nudgeTimer: null,
     firstNudgeAt: 0,
@@ -55,7 +56,7 @@ export async function resyncSimpleTree(session, socket) {
 
 export async function nudgeSimpleTree(session, socket, reason = "nudge") {
   const st = session.simpleTree;
-  if (!st || st.disposed) return;
+  if (!st || st.disposed || st.failed) return; 
 
   // If a rebuild currently running, schedule a future pass.
   if (st.rebuildInFlight) {
@@ -110,7 +111,14 @@ async function rebuild(session, socket, reason, opts = {}) {
   try {
     tree = await buildTree(session.container);
   } catch (e) {
-    console.warn("[simpleFS] scan error:", e.message);
+    if (e.message.includes("No such container") || e.message.includes("not found")) {
+      st.failed = true;
+      clearTimeout(st.loopTimer);
+      clearTimeout(st.nudgeTimer);
+      st.loopTimer = null;
+      st.nudgeTimer = null;
+      console.error("[simpleFS] container unavailable — stopping nudges for this session");
+    }
     st.rebuildInFlight = false;
     return;
   }
@@ -150,7 +158,7 @@ function emitSnapshot(session, socket, changed, reason) {
 
 function startLoop(session, socket) {
   const loop = async () => {
-    if (!session.simpleTree || session.simpleTree.disposed) return;
+    if (!session.simpleTree || session.simpleTree.disposed || session.simpleTree.failed) return;
     await rebuild(session, socket, "periodic");
     if (session.simpleTree && !session.simpleTree.disposed) {
       session.simpleTree.loopTimer = setTimeout(loop, SCAN_MS);

@@ -4,8 +4,8 @@ FROM node:20-bullseye AS client
 WORKDIR /app
 
 # Environment variable passed into Vite (adjust if different)
-ARG VITE_BACKEND_URL=http://localhost:8080
-ENV VITE_BACKEND_URL=${VITE_BACKEND_URL}
+# ARG VITE_BACKEND_URL=http://192.168.66.16:8080/
+# ENV VITE_REACT_APP_SERVER_URL=${VITE_BACKEND_URL}
 
 # Copy manifests only (ensure package-lock.json exists!)
 COPY package*.json ./
