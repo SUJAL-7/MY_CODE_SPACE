@@ -1,137 +1,20 @@
-import Docker from "dockerode";
 import fs from "fs/promises";
 import fsSync from "fs";
-import path from "path";
-import crypto from "crypto";
+import {
+  FORCED_BASE_IMAGE, SANDBOX_AUTOREMOVE, NETWORK_MODE, READONLY_ROOT,
+  RETAIN_CAP_DROP_ALL, ALLOWED_EXTRA_CAPS, SANDBOX_PIDS_LIMIT,
+  ULIMIT_NOFILE, ULIMIT_NPROC, SANDBOX_RUNTIME, BLKIO_READ_BPS, BLKIO_WRITE_BPS,
+  BLKIO_READ_IOPS, BLKIO_WRITE_IOPS, UID, GID, USE_HOST_WORKSPACE,
+  WORKSPACE_PATH, ENABLE_APT_CAPS, SANDBOX_TMPFS, MINIMAL_RESOURCE_MODE,
+  SANDBOX_MEMORY, SANDBOX_CPUS
+} from "./config.js";
+import { docker } from "./docker.js";
+import { pullImageIfNeeded } from "./pullImage.js";
+import {
+  logDebug, imageAllowed, sessionWorkspaceDir, parseMemory,
+  parseCPUs, escapeBash
+} from "./utils.js";
 
-const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET || "/var/run/docker.sock" });
-
-/* ---------- Base Config ---------- */
-const WORKSPACES_ROOT = process.env.WORKSPACES_ROOT || path.join(process.cwd(), "workspaces");
-
-// Default to a lightweight dev image if not overridden by env.
-const FORCED_BASE_IMAGE = (process.env.FORCED_BASE_IMAGE || "dev-base:latest").trim();
-
-const ALLOWLIST_IMAGES = (process.env.ALLOWLIST_IMAGES || FORCED_BASE_IMAGE)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-const DIGEST_REQUIRED = (process.env.DIGEST_REQUIRED || "false") === "true";
-const NETWORK_MODE = process.env.FORCED_NETWORK_MODE || "bridge";
-
-let READONLY_ROOT = (process.env.READONLY_ROOT || "false") === "true";
-let SANDBOX_MEMORY = process.env.SANDBOX_MEMORY || "1g";
-let SANDBOX_CPUS = process.env.SANDBOX_CPUS || "1.0";
-const SANDBOX_AUTOREMOVE = process.env.SANDBOX_AUTOREMOVE !== "false";
-const SANDBOX_RUNTIME = process.env.SANDBOX_RUNTIME || "";
-
-// Security/caps
-const RETAIN_CAP_DROP_ALL = (process.env.RETAIN_CAP_DROP_ALL || "1") === "1";
-const ALLOWED_EXTRA_CAPS = (process.env.ALLOWED_EXTRA_CAPS || "").split(/\s+/).filter(Boolean);
-
-// Limits
-const SANDBOX_PIDS_LIMIT = parseInt(process.env.SANDBOX_PIDS_LIMIT || "0", 10);
-const ULIMIT_NOFILE = parseInt(process.env.ULIMIT_NOFILE || "0", 10);
-const ULIMIT_NPROC = parseInt(process.env.ULIMIT_NPROC || "0", 10);
-
-// Optional blkio (throttling)
-const BLKIO_READ_BPS = parseInt(process.env.BLKIO_READ_BPS || "0", 10); // bytes/sec
-const BLKIO_WRITE_BPS = parseInt(process.env.BLKIO_WRITE_BPS || "0", 10);
-const BLKIO_READ_IOPS = parseInt(process.env.BLKIO_READ_IOPS || "0", 10); // IOPS
-const BLKIO_WRITE_IOPS = parseInt(process.env.BLKIO_WRITE_IOPS || "0", 10);
-
-// Minimal resource mode override
-const MINIMAL_RESOURCE_MODE = (process.env.MINIMAL_RESOURCE_MODE || "0") === "1";
-if (MINIMAL_RESOURCE_MODE) {
-  // Force minimal values (tweak here if you want even smaller)
-  SANDBOX_MEMORY = "128m";
-  SANDBOX_CPUS = "0.05"; // 5% of a CPU
-  READONLY_ROOT = false; // allow basic installs if needed
-}
-
-const UID = process.env.SANDBOX_USER_UID || "";
-const GID = process.env.SANDBOX_USER_GID || "";
-const DEBUG_SANDBOX = process.env.DEBUG_SANDBOX === "1";
-
-const USE_HOST_WORKSPACE = (process.env.USE_HOST_WORKSPACE || "false") === "true";
-const WORKSPACE_PATH = process.env.WORKSPACE_PATH || "/workspace";
-
-// (Optional) apt caps integration (default to enabled to allow apt installs)
-const ENABLE_APT_CAPS = (process.env.ENABLE_APT_CAPS || "1") === "1";
-
-// Optional tmpfs mount, e.g. "/tmp:rw,noexec,size=64m"
-const SANDBOX_TMPFS = process.env.SANDBOX_TMPFS || "";
-
-/* ---------- Exports (small helpers) ---------- */
-export function getAllowlist() { return ALLOWLIST_IMAGES; }
-export function getAllowedNetworkModes() { return [NETWORK_MODE]; }
-export function getDefaultNetworkMode() { return NETWORK_MODE; }
-
-function logDebug(...a) {
-  if (DEBUG_SANDBOX) console.log("[containerManager]", ...a);
-}
-
-/* ---------- Validation ---------- */
-function imageAllowed(img) {
-  if (!ALLOWLIST_IMAGES.includes(img)) return false;
-  if (DIGEST_REQUIRED && !/@sha256:[0-9a-f]{64}$/.test(img)) return false;
-  return true;
-}
-
-/* ---------- Workspace ---------- */
-export async function ensureWorkspaceRoot() {
-  if (USE_HOST_WORKSPACE && !fsSync.existsSync(WORKSPACES_ROOT)) {
-    fsSync.mkdirSync(WORKSPACES_ROOT, { recursive: true, mode: 0o750 });
-  }
-}
-
-function sessionWorkspaceDir(sessionId) {
-  return path.join(WORKSPACES_ROOT, sessionId);
-}
-
-/* ---------- Parsers ---------- */
-function parseMemory(mem) {
-  if (!mem) return;
-  const m = /^(\d+(?:\.\d+)?)([kKmMgG])?$/.exec(mem);
-  if (!m) return;
-  const num = parseFloat(m[1]);
-  const unit = (m[2] || "").toLowerCase();
-  const mult =
-    unit === "k" ? 1024 :
-    unit === "m" ? 1024 * 1024 :
-    unit === "g" ? 1024 * 1024 * 1024 : 1;
-  return Math.round(num * mult);
-}
-
-function parseCPUs(cpus) {
-  if (!cpus) return;
-  const n = parseFloat(cpus);
-  if (isNaN(n) || n <= 0) return;
-  // Docker NanoCPUs = CPUs * 1e9
-  return Math.round(n * 1e9);
-}
-
-/* ---------- Image Pull ---------- */
-async function pullImageIfNeeded(image) {
-  try {
-    await docker.getImage(image).inspect();
-  } catch {
-    if (!imageAllowed(image)) throw new Error("Image not allowed");
-    await new Promise((resolve, reject) => {
-      docker.pull(image, (err, stream) => {
-        if (err) return reject(err);
-        docker.modem.followProgress(
-          stream,
-          (err2) => (err2 ? reject(err2) : resolve()),
-          () => {} // progress handler noop
-        );
-      });
-    });
-  }
-}
-
-/* ---------- Main: Create Session + Exec Shell ---------- */
 export async function createSessionExecShell({ sessionId, username }) {
   const baseImage = FORCED_BASE_IMAGE;
   if (!imageAllowed(baseImage)) throw new Error("Forced base image not allowed");
@@ -303,7 +186,7 @@ export async function createSessionExecShell({ sessionId, username }) {
   };
 }
 
-/* ---------- Helper exec (capture stdout/stderr as string) ---------- */
+// keep execCapture inside here
 async function execCapture(container, cmd) {
   const exec = await container.exec({
     Cmd: ["bash", "-lc", cmd],
@@ -322,7 +205,6 @@ async function execCapture(container, cmd) {
   });
 }
 
-/* ---------- Resize TTY ---------- */
 export async function resizeExecTTY(container, exec, { cols, rows }) {
   try {
     await docker.modem.post(
@@ -332,7 +214,6 @@ export async function resizeExecTTY(container, exec, { cols, rows }) {
   } catch {}
 }
 
-/* ---------- Stop & Remove Container ---------- */
 export async function stopAndRemoveContainer(container) {
   try {
     await container.stop({ t: 1 }).catch(() => {});
@@ -343,7 +224,6 @@ export async function stopAndRemoveContainer(container) {
   } catch {}
 }
 
-/* ---------- Workspace Cleanup ---------- */
 export async function removeWorkspaceDir(sessionId) {
   if (!USE_HOST_WORKSPACE) return;
   try {
@@ -351,7 +231,6 @@ export async function removeWorkspaceDir(sessionId) {
   } catch {}
 }
 
-/* ---------- Stats Stream ---------- */
 export function startStatsStream(session, onStat, onEnd) {
   const { container } = session;
   let closed = false;
@@ -394,13 +273,4 @@ export function stopStatsStream(session) {
     session._statsStream?.destroy();
     delete session._statsStream;
   } catch {}
-}
-
-/* ---------- Utilities ---------- */
-export function randomId(bytes = 8) {
-  return crypto.randomBytes(bytes).toString("hex");
-}
-
-function escapeBash(p) {
-  return p.replace(/(["`$\\])/g, "\\$1");
 }

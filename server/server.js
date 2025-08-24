@@ -8,17 +8,26 @@ import os from "os";
 import cookieParser from "cookie-parser";
 import { v4 as uuidv4 } from "uuid";
 
+// import {
+//   ensureWorkspaceRoot,
+//   getAllowlist,
+//   getAllowedNetworkModes,
+//   getDefaultNetworkMode,
+// } from "./containerManager.js";
 import {
   ensureWorkspaceRoot,
   getAllowlist,
   getAllowedNetworkModes,
   getDefaultNetworkMode,
-} from "./containerManager.js";
-import { setupSocketHandlers, SESSION_GRACE_PERIOD_MS ,startIdleMonitor } from "./socketHandlers.js";
+} from "./containerManager/index.js";
+
+// import { setupSocketHandlers, SESSION_GRACE_PERIOD_MS ,startIdleMonitor } from "./socketHandlers.js";
+import { setupSocketHandlers, SESSION_GRACE_PERIOD_MS ,startIdleMonitor } from "./socket/index.js";
 import { getSessionStats } from "./sessionManager.js";
 
 const PORT = process.env.PORT || 8080;
 const CLIENT_URL = process.env.CLIENT_URL || "http://3.108.254.28:3100";
+// const CLIENT_URL = "http://localhost:3100";
 const MAX_IDLE_MINUTES = parseInt(process.env.MAX_IDLE_MINUTES || "120", 10);
 
 await ensureWorkspaceRoot();
